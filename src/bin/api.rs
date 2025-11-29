@@ -7,15 +7,15 @@ use clap::Parser;
 use eyre::Result;
 
 use blockscout_exex::api::{create_router, ApiState};
-use blockscout_exex::index_db::IndexDb;
+use blockscout_exex::fdb_index::FdbIndex;
 
 #[derive(Parser)]
 #[command(name = "blockscout-api")]
-#[command(about = "Blockscout-compatible API server")]
+#[command(about = "Blockscout-compatible API server backed by FoundationDB")]
 struct Args {
-    /// Index database path
-    #[arg(long, default_value = "./blockscout-index")]
-    index_path: PathBuf,
+    /// FoundationDB cluster file path (uses default if not specified)
+    #[arg(long)]
+    cluster_file: Option<PathBuf>,
 
     /// API server port (ignored if --socket is set)
     #[arg(long, default_value = "3000")]
@@ -36,13 +36,30 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    tracing::info!("Opening index database at {:?}", args.index_path);
-    let index_db = IndexDb::open(&args.index_path)?;
+    // Initialize FDB network - must be done once before any FDB operations
+    // Safety: We ensure the network guard is held until program exit
+    let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
 
-    let last_block = index_db.last_indexed_block()?;
+    tracing::info!("Connecting to FoundationDB...");
+    let index = match &args.cluster_file {
+        Some(path) => {
+            tracing::info!("Using cluster file: {:?}", path);
+            Arc::new(FdbIndex::open(path)?)
+        }
+        None => {
+            tracing::info!("Using default cluster file");
+            Arc::new(FdbIndex::open_default()?)
+        }
+    };
+
+    let last_block = index.last_indexed_block().await?;
     tracing::info!("Last indexed block: {:?}", last_block);
 
-    let state = Arc::new(ApiState { index_db });
+    let state = Arc::new(ApiState {
+        index,
+        #[cfg(feature = "reth")]
+        reth: None,
+    });
     let router = create_router(state);
 
     if let Some(socket_path) = args.socket {

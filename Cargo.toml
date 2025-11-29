@@ -22,8 +22,8 @@ name = "blockscout-subscriber"
 path = "src/bin/subscriber.rs"
 
 [dependencies]
-# Database - use redb for simplicity (pure Rust, no FFI issues)
-redb = "2"
+# Database - FoundationDB for distributed key-value storage
+foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_1"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -61,10 +61,13 @@ reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", opt
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
+reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
+chrono = "0.4.42"
 
 [features]
 default = []
-reth = ["reth-db", "reth-provider", "reth-primitives", "reth-chainspec"]
+reth = ["reth-db", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
 
 [dev-dependencies]
-tempfile = "3"
+tokio-test = "0.4"

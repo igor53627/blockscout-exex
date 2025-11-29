@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-use blockscout_exex::index_db::{IndexDb, TokenTransfer};
+use blockscout_exex::fdb_index::{FdbIndex, TokenTransfer};
 use blockscout_exex::transform::decode_erc20_transfer;
 
 #[derive(Parser)]
@@ -28,9 +28,9 @@ struct Args {
     #[arg(long, default_value = "http://localhost:8545")]
     rpc_url: String,
 
-    /// Index database path
-    #[arg(long, default_value = "./blockscout-index")]
-    index_path: PathBuf,
+    /// FoundationDB cluster file path (uses default if not specified)
+    #[arg(long)]
+    cluster_file: Option<PathBuf>,
 
     /// Reconnect delay on disconnect (seconds)
     #[arg(long, default_value = "5")]
@@ -57,6 +57,7 @@ struct NewHeadResult {
 
 #[derive(Debug, Deserialize)]
 struct RpcBlock {
+    #[allow(dead_code)]
     number: String,
     timestamp: String,
     transactions: Vec<RpcTransaction>,
@@ -67,6 +68,8 @@ struct RpcTransaction {
     hash: String,
     from: String,
     to: Option<String>,
+    #[serde(rename = "transactionIndex")]
+    transaction_index: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,8 +155,15 @@ fn parse_log(rpc_log: &RpcLog) -> Option<Log> {
     Some(Log::new(address, topics, data.into()).unwrap())
 }
 
+fn parse_tx_index(tx: &RpcTransaction) -> u32 {
+    tx.transaction_index
+        .as_ref()
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0)
+}
+
 async fn index_block(
-    index_db: &IndexDb,
+    index: &FdbIndex,
     rpc: &RpcClient,
     block_hash: &str,
     block_number: u64,
@@ -171,17 +181,18 @@ async fn index_block(
         .map(|r| (r.transaction_hash.clone(), r))
         .collect();
 
-    let mut batch = index_db.write_batch()?;
+    let mut batch = index.write_batch();
 
     for tx in block.transactions {
         let tx_hash: TxHash = tx.hash.parse()?;
         let from: Address = tx.from.parse()?;
+        let tx_idx = parse_tx_index(&tx);
 
-        batch.insert_address_tx(from, tx_hash);
+        batch.insert_address_tx(from, tx_hash, block_number, tx_idx);
 
         if let Some(to_str) = &tx.to {
             if let Ok(to) = to_str.parse::<Address>() {
-                batch.insert_address_tx(to, tx_hash);
+                batch.insert_address_tx(to, tx_hash, block_number, tx_idx);
             }
         }
 
@@ -208,13 +219,13 @@ async fn index_block(
         }
     }
 
-    batch.set_last_indexed_block(block_number)?;
+    batch.commit(block_number).await?;
     info!(block = block_number, "Indexed block");
 
     Ok(())
 }
 
-async fn subscribe_loop(args: &Args, index_db: &IndexDb) -> Result<()> {
+async fn subscribe_loop(args: &Args, index: &FdbIndex) -> Result<()> {
     let rpc = RpcClient::new(&args.rpc_url);
 
     info!("Connecting to {}", args.ws_url);
@@ -258,7 +269,7 @@ async fn subscribe_loop(args: &Args, index_db: &IndexDb) -> Result<()> {
                         )?;
 
                         if let Err(e) =
-                            index_block(index_db, &rpc, &params.result.hash, block_number).await
+                            index_block(index, &rpc, &params.result.hash, block_number).await
                         {
                             error!("Failed to index block {}: {}", block_number, e);
                         }
@@ -290,11 +301,23 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    info!("Opening index database at {:?}", args.index_path);
-    let index_db = IndexDb::open(&args.index_path)?;
+    // Initialize FDB network
+    let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
+
+    info!("Connecting to FoundationDB...");
+    let index = match &args.cluster_file {
+        Some(path) => {
+            info!("Using cluster file: {:?}", path);
+            FdbIndex::open(path)?
+        }
+        None => {
+            info!("Using default cluster file");
+            FdbIndex::open_default()?
+        }
+    };
 
     loop {
-        match subscribe_loop(&args, &index_db).await {
+        match subscribe_loop(&args, &index).await {
             Ok(_) => {
                 info!("Subscription ended, reconnecting...");
             }
