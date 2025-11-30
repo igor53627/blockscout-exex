@@ -822,17 +822,17 @@ impl<'a> WriteBatch<'a> {
         addr_tx_size + tx_block_size + transfer_size + holder_size + counter_size + daily_size
     }
 
+    /// Returns the number of transfers in this batch
+    pub fn transfer_count(&self) -> usize {
+        self.transfers.len()
+    }
+
     pub async fn commit(self, last_block: u64) -> Result<()> {
-        const MAX_TXN_SIZE: usize = 9_000_000; // 9MB to be safe (FDB limit is 10MB)
+        const MAX_TRANSFERS_PER_TXN: usize = 5000; // ~2.5MB for transfers, safe limit
         
-        let estimated_size = self.estimate_size();
-        if estimated_size > MAX_TXN_SIZE {
-            tracing::warn!(
-                estimated_size = estimated_size,
-                transfers = self.transfers.len(),
-                txs = self.tx_blocks.len(),
-                "Batch too large, this may fail"
-            );
+        // If we have too many transfers, split into multiple transactions
+        if self.transfers.len() > MAX_TRANSFERS_PER_TXN {
+            return self.commit_chunked(last_block, MAX_TRANSFERS_PER_TXN).await;
         }
 
         let address_txs = self.address_txs;
@@ -973,6 +973,173 @@ impl<'a> WriteBatch<'a> {
                 }
             })
             .await?;
+
+        Ok(())
+    }
+
+    /// Commit a large batch by splitting transfers into chunks
+    async fn commit_chunked(self, last_block: u64, chunk_size: usize) -> Result<()> {
+        let num_chunks = (self.transfers.len() + chunk_size - 1) / chunk_size;
+        tracing::info!(
+            transfers = self.transfers.len(),
+            chunks = num_chunks,
+            "Splitting large batch into chunks"
+        );
+
+        // First chunk includes txs and addresses
+        let mut transfer_iter = self.transfers.into_iter();
+        let first_chunk: Vec<_> = transfer_iter.by_ref().take(chunk_size).collect();
+        
+        // Commit first chunk with all the tx/address data
+        Self::commit_chunk(
+            self.db,
+            self.address_txs,
+            self.tx_blocks,
+            first_chunk,
+            self.holder_updates.clone(),
+            self.daily_tx_counts.clone().into_iter().collect(),
+            self.daily_transfer_counts.clone().into_iter().collect(),
+            self.address_tx_increments.clone().into_iter().collect(),
+            self.address_transfer_increments.clone().into_iter().collect(),
+            last_block,
+        ).await?;
+
+        // Commit remaining chunks (transfers only)
+        loop {
+            let chunk: Vec<_> = transfer_iter.by_ref().take(chunk_size).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            
+            Self::commit_chunk(
+                self.db,
+                Vec::new(),
+                Vec::new(),
+                chunk,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                last_block,
+            ).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn commit_chunk(
+        db: &Database,
+        address_txs: Vec<(Address, TxHash, u64, u32)>,
+        tx_blocks: Vec<(TxHash, u64)>,
+        transfers: Vec<TokenTransfer>,
+        holder_updates: Vec<(Address, Address, U256, Option<U256>)>,
+        daily_tx_counts: Vec<((u16, u8, u8), i64)>,
+        daily_transfer_counts: Vec<((u16, u8, u8), i64)>,
+        address_tx_increments: Vec<(Address, i64)>,
+        address_transfer_increments: Vec<(Address, i64)>,
+        last_block: u64,
+    ) -> Result<()> {
+        db.run(|trx, _| {
+            let address_txs = address_txs.clone();
+            let tx_blocks = tx_blocks.clone();
+            let transfers = transfers.clone();
+            let holder_updates = holder_updates.clone();
+            let daily_tx_counts = daily_tx_counts.clone();
+            let daily_transfer_counts = daily_transfer_counts.clone();
+            let address_tx_increments = address_tx_increments.clone();
+            let address_transfer_increments = address_transfer_increments.clone();
+
+            async move {
+                // Write address → tx mappings
+                for (addr, tx_hash, block, tx_idx) in &address_txs {
+                    let key = FdbIndex::address_tx_key(addr, *block, *tx_idx);
+                    trx.set(&key, tx_hash.as_slice());
+                }
+
+                // Write tx → block mappings
+                for (tx_hash, block_num) in &tx_blocks {
+                    let key = FdbIndex::tx_block_key(tx_hash);
+                    trx.set(&key, &block_num.to_be_bytes());
+                }
+
+                // Write transfers
+                for transfer in &transfers {
+                    let value = bincode::serialize(transfer).unwrap();
+
+                    let from_addr = Address::from(transfer.from);
+                    let from_key = FdbIndex::address_transfer_key(
+                        &from_addr,
+                        transfer.block_number,
+                        transfer.log_index,
+                    );
+                    trx.set(&from_key, &value);
+
+                    let to_addr = Address::from(transfer.to);
+                    let to_key = FdbIndex::address_transfer_key(
+                        &to_addr,
+                        transfer.block_number,
+                        transfer.log_index,
+                    );
+                    trx.set(&to_key, &value);
+
+                    let token_addr = Address::from(transfer.token_address);
+                    let token_key = FdbIndex::token_transfer_key(
+                        &token_addr,
+                        transfer.block_number,
+                        transfer.log_index,
+                    );
+                    trx.set(&token_key, &value);
+                }
+
+                // Write holder updates
+                for (token, holder, new_balance, _) in &holder_updates {
+                    let key = FdbIndex::token_holder_key(token, holder);
+                    trx.set(&key, &new_balance.to_be_bytes::<32>());
+                }
+
+                // Update last indexed block
+                let meta_key = FdbIndex::meta_key(META_LAST_BLOCK);
+                trx.set(&meta_key, &last_block.to_be_bytes());
+
+                // Atomically increment counters
+                let tx_count = tx_blocks.len() as i64;
+                let transfer_count = transfers.len() as i64;
+
+                if tx_count > 0 {
+                    let key = FdbIndex::counter_key(COUNTER_TOTAL_TXS);
+                    trx.atomic_op(&key, &tx_count.to_le_bytes(), MutationType::Add);
+                }
+
+                if transfer_count > 0 {
+                    let key = FdbIndex::counter_key(COUNTER_TOTAL_TRANSFERS);
+                    trx.atomic_op(&key, &transfer_count.to_le_bytes(), MutationType::Add);
+                }
+
+                for (addr, count) in &address_tx_increments {
+                    let key = FdbIndex::address_counter_key(addr, ADDR_COUNTER_TX);
+                    trx.atomic_op(&key, &count.to_le_bytes(), MutationType::Add);
+                }
+
+                for (addr, count) in &address_transfer_increments {
+                    let key = FdbIndex::address_counter_key(addr, ADDR_COUNTER_TOKEN_TRANSFER);
+                    trx.atomic_op(&key, &count.to_le_bytes(), MutationType::Add);
+                }
+
+                for ((year, month, day), count) in &daily_tx_counts {
+                    let key = FdbIndex::daily_metric_key(*year, *month, *day, METRIC_TXS);
+                    trx.atomic_op(&key, &count.to_le_bytes(), MutationType::Add);
+                }
+
+                for ((year, month, day), count) in &daily_transfer_counts {
+                    let key = FdbIndex::daily_metric_key(*year, *month, *day, METRIC_TRANSFERS);
+                    trx.atomic_op(&key, &count.to_le_bytes(), MutationType::Add);
+                }
+
+                Ok(())
+            }
+        })
+        .await?;
 
         Ok(())
     }
