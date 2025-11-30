@@ -356,10 +356,13 @@ mod direct {
                 // Record daily metrics for this block
                 batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
-                // Commit per-block to avoid FDB 10MB transaction limit
-                // Blocks with many token transfers (NFT mints) can exceed the limit
-                batch.commit(block_num).await?;
-                batch = index.write_batch();
+                // Commit early if batch is getting large (avoid FDB 10MB limit)
+                // 5000 transfers * 3 indexes * ~150 bytes = ~2.25MB, safe threshold
+                if batch.transfer_count() >= 5000 {
+                    debug!(block = block_num, transfers = batch.transfer_count(), "Early commit due to size");
+                    batch.commit(block_num).await?;
+                    batch = index.write_batch();
+                }
 
                 processed += 1;
                 if processed % 1000 == 0 {
@@ -372,10 +375,9 @@ mod direct {
                 }
             }
 
-            // Final commit for any remaining items (shouldn't be any with per-block commits)
-            if batch_end > batch_start {
-                debug!(from = batch_start, to = batch_end, "Batch complete");
-            }
+            // Commit remaining batch
+            batch.commit(batch_end).await?;
+            debug!(from = batch_start, to = batch_end, "Batch complete");
 
             // Index new tokens to Meilisearch
             if let Some(search) = search {
@@ -533,15 +535,12 @@ async fn run_rpc_backfill(
             // Record daily metrics for this block
             batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
-            // Commit per-block to avoid FDB 10MB transaction limit
-            debug!(
-                block = block_num,
-                txs = block_tx_count,
-                transfers = block_transfer_count,
-                "Committing block"
-            );
-            batch.commit(block_num).await?;
-            batch = index.write_batch();
+            // Commit early if batch is getting large (avoid FDB 10MB limit)
+            if batch.transfer_count() >= 5000 {
+                debug!(block = block_num, transfers = batch.transfer_count(), "Early commit due to size");
+                batch.commit(block_num).await?;
+                batch = index.write_batch();
+            }
 
             processed += 1;
             if processed % 1000 == 0 {
@@ -554,6 +553,8 @@ async fn run_rpc_backfill(
             }
         }
 
+        // Commit remaining batch
+        batch.commit(batch_end).await?;
         debug!(from = batch_start, to = batch_end, "Batch complete");
 
         // Index new tokens to Meilisearch
