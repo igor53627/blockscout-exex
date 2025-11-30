@@ -239,22 +239,39 @@ fn parse_tx_index(tx: &RpcTransaction) -> u32 {
 mod direct {
     use super::*;
     use alloy_primitives::Log;
+    use blockscout_exex::meili::{SearchClient, TokenDocument};
     use blockscout_exex::reth_reader::RethReader;
 
-    pub fn run_direct_backfill(
-        reader: &RethReader,
-        index: &FdbIndex,
-        from_block: u64,
-        to_block: u64,
-        batch_size: u64,
-    ) -> Result<()> {
+    pub struct DirectBackfillConfig<'a> {
+        pub reader: &'a RethReader,
+        pub index: &'a FdbIndex,
+        pub search: Option<&'a SearchClient>,
+        pub chain: &'a str,
+        pub from_block: u64,
+        pub to_block: u64,
+        pub batch_size: u64,
+    }
+
+    pub async fn run_direct_backfill(config: DirectBackfillConfig<'_>) -> Result<()> {
+        let DirectBackfillConfig {
+            reader,
+            index,
+            search,
+            chain,
+            from_block,
+            to_block,
+            batch_size,
+        } = config;
+
         let total = to_block - from_block + 1;
         let mut processed = 0u64;
+        let mut seen_tokens: HashSet<Address> = HashSet::new();
 
         for batch_start in (from_block..=to_block).step_by(batch_size as usize) {
             let batch_end = (batch_start + batch_size - 1).min(to_block);
 
             let mut batch = index.write_batch();
+            let mut new_tokens: Vec<(Address, TokenType)> = Vec::new();
 
             for block_num in batch_start..=batch_end {
                 let Some(block) = reader.block_by_number(block_num)? else {
@@ -263,6 +280,9 @@ mod direct {
 
                 let receipts = reader.receipts_by_block(block_num)?.unwrap_or_default();
                 let timestamp = block.header().timestamp;
+
+                let mut block_tx_count = 0i64;
+                let mut block_transfer_count = 0i64;
 
                 for (tx_idx, tx) in block.transactions_with_sender().enumerate() {
                     let (from, tx) = tx;
@@ -278,6 +298,7 @@ mod direct {
 
                     // Index tx → block
                     batch.insert_tx_block(tx_hash, block_num);
+                    block_tx_count += 1;
 
                     // Process logs for token transfers (ERC-20, ERC-721, ERC-1155)
                     if let Some(receipt) = receipts.get(tx_idx) {
@@ -319,10 +340,20 @@ mod direct {
                                     ),
                                 };
                                 batch.insert_transfer(transfer);
+                                block_transfer_count += 1;
+
+                                // Track new tokens for Meilisearch indexing
+                                if !seen_tokens.contains(&decoded.token_address) {
+                                    seen_tokens.insert(decoded.token_address);
+                                    new_tokens.push((decoded.token_address, decoded.token_type));
+                                }
                             }
                         }
                     }
                 }
+
+                // Record daily metrics for this block
+                batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
                 processed += 1;
                 if processed % 1000 == 0 {
@@ -335,12 +366,49 @@ mod direct {
                 }
             }
 
-            // Commit batch synchronously using tokio runtime
-            tokio::runtime::Handle::current().block_on(batch.commit(batch_end))?;
+            batch.commit(batch_end).await?;
             debug!(from = batch_start, to = batch_end, "Committed batch");
+
+            // Index new tokens to Meilisearch
+            if let Some(search) = search {
+                if !new_tokens.is_empty() {
+                    let token_docs = fetch_token_docs_direct(reader, chain, &new_tokens);
+                    if !token_docs.is_empty() {
+                        if let Err(e) = search.index_tokens(&token_docs).await {
+                            warn!("Failed to index tokens to Meilisearch: {}", e);
+                        } else {
+                            debug!(count = token_docs.len(), "Indexed tokens to Meilisearch");
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
+    }
+
+    fn fetch_token_docs_direct(
+        _reader: &RethReader,
+        chain: &str,
+        tokens: &[(Address, TokenType)],
+    ) -> Vec<TokenDocument> {
+        let mut docs = Vec::new();
+
+        for (token, token_type) in tokens {
+            let addr = format!("{:?}", token);
+            let type_str = token_type.as_str();
+
+            docs.push(TokenDocument::new(
+                chain,
+                &addr,
+                None,
+                None,
+                None,
+                type_str,
+            ));
+        }
+
+        docs
     }
 }
 
@@ -608,7 +676,8 @@ async fn main() -> Result<()> {
         info!("Opening reth database at {:?}", reth_db);
         info!("Static files at {:?}", static_files);
 
-        let reader = if args.chain == "sepolia" {
+        let chain = &args.chain;
+        let reader = if chain == "sepolia" {
             blockscout_exex::reth_reader::RethReader::open_sepolia(reth_db, &static_files)?
         } else {
             blockscout_exex::reth_reader::RethReader::open_mainnet(reth_db, &static_files)?
@@ -626,9 +695,29 @@ async fn main() -> Result<()> {
             args.to_block
         };
 
+        // Initialize Meilisearch client if configured
+        let search = if let Some(ref meili_url) = args.meili_url {
+            info!("Connecting to Meilisearch at {}", meili_url);
+            let client = SearchClient::new(meili_url, args.meili_key.as_deref(), chain);
+            if let Err(e) = client.ensure_indexes().await {
+                warn!("Failed to configure Meilisearch indexes: {}", e);
+            }
+            Some(client)
+        } else {
+            None
+        };
+
         info!(from = from_block, to = to_block, mode = "direct MDBX", "Starting backfill");
 
-        direct::run_direct_backfill(&reader, &index, from_block, to_block, args.batch_size)?;
+        direct::run_direct_backfill(direct::DirectBackfillConfig {
+            reader: &reader,
+            index: &index,
+            search: search.as_ref(),
+            chain,
+            from_block,
+            to_block,
+            batch_size: args.batch_size,
+        }).await?;
 
         info!("Backfill complete");
         return Ok(());
