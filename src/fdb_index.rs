@@ -830,6 +830,13 @@ impl<'a> WriteBatch<'a> {
     pub async fn commit(self, last_block: u64) -> Result<()> {
         const MAX_TRANSFERS_PER_TXN: usize = 3000; // ~1.5MB for transfers, safe limit
         
+        tracing::debug!(
+            transfers = self.transfers.len(),
+            txs = self.tx_blocks.len(),
+            addr_txs = self.address_txs.len(),
+            "Committing batch"
+        );
+        
         // If we have too many transfers, split into multiple transactions
         if self.transfers.len() > MAX_TRANSFERS_PER_TXN {
             return self.commit_chunked(last_block, MAX_TRANSFERS_PER_TXN).await;
