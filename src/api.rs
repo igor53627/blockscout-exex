@@ -2324,12 +2324,67 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn indexing_status(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    let last_block = state.index.last_indexed_block().await.unwrap_or(None);
+    let last_indexed = state.index.last_indexed_block().await.unwrap_or(None).unwrap_or(0);
+    
+    // Try to get chain head from RPC if configured
+    let (chain_head, blocks_behind, finished) = if let Some(ref rpc_url) = state.rpc_url {
+        match get_chain_head(rpc_url).await {
+            Ok(head) => {
+                let behind = if head > last_indexed { head - last_indexed } else { 0 };
+                let finished = behind <= 1; // Allow 1 block lag
+                (Some(head), behind, finished)
+            }
+            Err(_) => (None, 0, true)
+        }
+    } else {
+        (None, 0, true)
+    };
+
+    let ratio = if let Some(head) = chain_head {
+        if head > 0 {
+            format!("{:.4}", last_indexed as f64 / head as f64)
+        } else {
+            "1.00".to_string()
+        }
+    } else {
+        "1.00".to_string()
+    };
+
     Json(serde_json::json!({
-        "finished_indexing": true,
-        "indexed_blocks_ratio": "1.00",
-        "last_indexed_block": last_block
+        "finished_indexing": finished,
+        "finished_indexing_blocks": finished,
+        "indexed_blocks_ratio": ratio,
+        "indexed_internal_transactions_ratio": "1.00",
+        "last_indexed_block": last_indexed,
+        "chain_head": chain_head,
+        "blocks_behind": blocks_behind
     }))
+}
+
+async fn get_chain_head(rpc_url: &str) -> Result<u64, ()> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_blockNumber",
+        "params": [],
+        "id": 1
+    });
+    
+    let resp: serde_json::Value = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| ())?
+        .json()
+        .await
+        .map_err(|_| ())?;
+    
+    let hex = resp.get("result")
+        .and_then(|v| v.as_str())
+        .ok_or(())?;
+    
+    u64::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|_| ())
 }
 
 async fn get_address_txs(
