@@ -828,7 +828,7 @@ impl<'a> WriteBatch<'a> {
     }
 
     pub async fn commit(self, last_block: u64) -> Result<()> {
-        const MAX_TRANSFERS_PER_TXN: usize = 5000; // ~2.5MB for transfers, safe limit
+        const MAX_TRANSFERS_PER_TXN: usize = 3000; // ~1.5MB for transfers, safe limit
         
         // If we have too many transfers, split into multiple transactions
         if self.transfers.len() > MAX_TRANSFERS_PER_TXN {

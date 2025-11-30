@@ -356,15 +356,16 @@ mod direct {
                 // Record daily metrics for this block
                 batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
-                // Commit early if batch is getting large (avoid FDB 10MB limit)
-                // 5000 transfers * 3 indexes * ~150 bytes = ~2.25MB, safe threshold
-                if batch.transfer_count() >= 5000 {
-                    debug!(block = block_num, transfers = batch.transfer_count(), "Early commit due to size");
+                processed += 1;
+                
+                // Commit when batch reaches size limit (avoid FDB 10MB limit)
+                // Check after each block since single blocks can have 10k+ transfers
+                if batch.transfer_count() >= 4000 {
+                    info!(block = block_num, transfers = batch.transfer_count(), "Committing large batch");
                     batch.commit(block_num).await?;
                     batch = index.write_batch();
                 }
 
-                processed += 1;
                 if processed % 1000 == 0 {
                     let percent = (processed as f64 / total as f64) * 100.0;
                     info!(
@@ -535,14 +536,15 @@ async fn run_rpc_backfill(
             // Record daily metrics for this block
             batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
-            // Commit early if batch is getting large (avoid FDB 10MB limit)
-            if batch.transfer_count() >= 5000 {
-                debug!(block = block_num, transfers = batch.transfer_count(), "Early commit due to size");
+            processed += 1;
+            
+            // Commit when batch reaches size limit (avoid FDB 10MB limit)
+            if batch.transfer_count() >= 4000 {
+                info!(block = block_num, transfers = batch.transfer_count(), "Committing large batch");
                 batch.commit(block_num).await?;
                 batch = index.write_batch();
             }
 
-            processed += 1;
             if processed % 1000 == 0 {
                 let percent = (processed as f64 / total as f64) * 100.0;
                 info!(
