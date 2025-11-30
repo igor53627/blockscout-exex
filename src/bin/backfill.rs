@@ -286,13 +286,14 @@ mod direct {
 
                 for (tx_idx, tx) in block.transactions_with_sender().enumerate() {
                     let (from, tx) = tx;
-                    let tx_hash = tx.tx_hash();
+                    let tx_hash = *tx.tx_hash();
 
                     // Index by sender
                     batch.insert_address_tx(*from, tx_hash, block_num, tx_idx as u32);
 
-                    // Index by receiver
-                    if let Some(to) = tx.to() {
+                    // Index by receiver - use alloy_consensus Transaction trait
+                    use alloy_consensus::transaction::Transaction as TxTrait;
+                    if let Some(to) = TxTrait::to(tx) {
                         batch.insert_address_tx(to, tx_hash, block_num, tx_idx as u32);
                     }
 

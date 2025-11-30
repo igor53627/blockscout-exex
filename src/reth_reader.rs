@@ -12,8 +12,9 @@ use reth_chainspec::{MAINNET, SEPOLIA};
 use reth_db::{open_db_read_only, DatabaseEnv};
 use reth_node_ethereum::EthereumNode;
 use reth_node_types::NodeTypesWithDBAdapter;
+use alloy_eips::BlockHashOrNumber;
 use reth_provider::{
-    providers::StaticFileProvider, BlockHashOrNumber, BlockNumReader, BlockReader, ProviderFactory,
+    providers::StaticFileProvider, BlockNumReader, BlockReader, ProviderFactory,
     ReceiptProvider, StateProvider, TransactionVariant, TransactionsProvider,
 };
 
