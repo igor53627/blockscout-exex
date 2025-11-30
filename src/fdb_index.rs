@@ -808,7 +808,33 @@ impl<'a> WriteBatch<'a> {
         *self.daily_transfer_counts.entry(key).or_insert(0) += transfer_count;
     }
 
+    /// Estimate the transaction size in bytes
+    fn estimate_size(&self) -> usize {
+        // Key sizes: address(20) + block(8) + idx(4) = 32 + prefix
+        // Value sizes: tx_hash(32), transfer(~150 bytes serialized)
+        let addr_tx_size = self.address_txs.len() * (33 + 32);
+        let tx_block_size = self.tx_blocks.len() * (33 + 8);
+        let transfer_size = self.transfers.len() * (33 + 150) * 3; // 3 indexes per transfer
+        let holder_size = self.holder_updates.len() * (41 + 32);
+        let counter_size = (self.address_tx_increments.len() + self.address_transfer_increments.len()) * 30;
+        let daily_size = (self.daily_tx_counts.len() + self.daily_transfer_counts.len()) * 15;
+        
+        addr_tx_size + tx_block_size + transfer_size + holder_size + counter_size + daily_size
+    }
+
     pub async fn commit(self, last_block: u64) -> Result<()> {
+        const MAX_TXN_SIZE: usize = 9_000_000; // 9MB to be safe (FDB limit is 10MB)
+        
+        let estimated_size = self.estimate_size();
+        if estimated_size > MAX_TXN_SIZE {
+            tracing::warn!(
+                estimated_size = estimated_size,
+                transfers = self.transfers.len(),
+                txs = self.tx_blocks.len(),
+                "Batch too large, this may fail"
+            );
+        }
+
         let address_txs = self.address_txs;
         let tx_blocks = self.tx_blocks;
         let transfers = self.transfers;

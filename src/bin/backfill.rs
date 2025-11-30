@@ -356,6 +356,11 @@ mod direct {
                 // Record daily metrics for this block
                 batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
+                // Commit per-block to avoid FDB 10MB transaction limit
+                // Blocks with many token transfers (NFT mints) can exceed the limit
+                batch.commit(block_num).await?;
+                batch = index.write_batch();
+
                 processed += 1;
                 if processed % 1000 == 0 {
                     let percent = (processed as f64 / total as f64) * 100.0;
@@ -367,8 +372,10 @@ mod direct {
                 }
             }
 
-            batch.commit(batch_end).await?;
-            debug!(from = batch_start, to = batch_end, "Committed batch");
+            // Final commit for any remaining items (shouldn't be any with per-block commits)
+            if batch_end > batch_start {
+                debug!(from = batch_start, to = batch_end, "Batch complete");
+            }
 
             // Index new tokens to Meilisearch
             if let Some(search) = search {
@@ -526,6 +533,10 @@ async fn run_rpc_backfill(
             // Record daily metrics for this block
             batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
+            // Commit per-block to avoid FDB 10MB transaction limit
+            batch.commit(block_num).await?;
+            batch = index.write_batch();
+
             processed += 1;
             if processed % 1000 == 0 {
                 let percent = (processed as f64 / total as f64) * 100.0;
@@ -537,8 +548,7 @@ async fn run_rpc_backfill(
             }
         }
 
-        batch.commit(batch_end).await?;
-        debug!(from = batch_start, to = batch_end, "Committed batch");
+        debug!(from = batch_start, to = batch_end, "Batch complete");
 
         // Index new tokens to Meilisearch
         if let Some(search) = search {
