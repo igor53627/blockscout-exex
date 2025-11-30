@@ -1,32 +1,55 @@
-//! Backfill tool - reads from JSON-RPC and indexes into FoundationDB
+//! Backfill tool - indexes blockchain data into FoundationDB
 //!
-//! This is a standalone tool that doesn't require linking against reth.
-//! It uses JSON-RPC to fetch blocks and receipts.
+//! Supports multiple modes:
+//! - HTTP JSON-RPC mode (default): fetches via HTTP
+//! - IPC mode (--ipc-path): fetches via Unix socket, faster than HTTP
+//! - Direct MDBX mode (--reth-db): reads reth database directly, fastest
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use alloy_primitives::{Address, Log, TxHash};
 use clap::Parser;
 use eyre::Result;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use blockscout_exex::fdb_index::{FdbIndex, TokenTransfer};
-use blockscout_exex::transform::decode_erc20_transfer;
+use blockscout_exex::meili::{SearchClient, TokenDocument};
+use blockscout_exex::transform::{decode_token_transfer, TokenType};
 
 #[derive(Parser)]
 #[command(name = "blockscout-backfill")]
-#[command(about = "Backfill FoundationDB index from JSON-RPC")]
+#[command(about = "Backfill FoundationDB index from reth")]
 struct Args {
-    /// JSON-RPC endpoint URL
+    /// JSON-RPC endpoint URL (used when --ipc-path is not set)
     #[arg(long, default_value = "http://localhost:8545")]
     rpc_url: String,
+
+    /// Path to IPC socket (e.g., /mnt/sepolia/data/reth.ipc)
+    #[arg(long)]
+    ipc_path: Option<PathBuf>,
+
+    /// Path to reth database directory (enables direct MDBX reading)
+    #[cfg(feature = "reth")]
+    #[arg(long)]
+    reth_db: Option<PathBuf>,
+
+    /// Path to reth static files directory (required with --reth-db)
+    #[cfg(feature = "reth")]
+    #[arg(long)]
+    reth_static_files: Option<PathBuf>,
+
+    /// Chain name: mainnet or sepolia
+    #[cfg(feature = "reth")]
+    #[arg(long, default_value = "sepolia")]
+    chain: String,
 
     /// FoundationDB cluster file path (uses default if not specified)
     #[arg(long)]
     cluster_file: Option<PathBuf>,
 
-    /// Starting block number (0 = from beginning)
+    /// Starting block number (0 = from last indexed + 1)
     #[arg(long, default_value = "0")]
     from_block: u64,
 
@@ -37,7 +60,17 @@ struct Args {
     /// Batch size for commits
     #[arg(long, default_value = "1000")]
     batch_size: u64,
+
+    /// Meilisearch URL (optional, enables search indexing)
+    #[arg(long)]
+    meili_url: Option<String>,
+
+    /// Meilisearch API key (optional)
+    #[arg(long)]
+    meili_key: Option<String>,
 }
+
+// ============ JSON-RPC Types and Client ============
 
 #[derive(Debug, Deserialize)]
 struct RpcBlock {
@@ -70,16 +103,28 @@ struct RpcLog {
     data: String,
 }
 
+enum RpcTransport {
+    Http { url: String, client: reqwest::Client },
+    Ipc { path: PathBuf },
+}
+
 struct RpcClient {
-    url: String,
-    client: reqwest::Client,
+    transport: RpcTransport,
 }
 
 impl RpcClient {
-    fn new(url: &str) -> Self {
+    fn new_http(url: &str) -> Self {
         Self {
-            url: url.to_string(),
-            client: reqwest::Client::new(),
+            transport: RpcTransport::Http {
+                url: url.to_string(),
+                client: reqwest::Client::new(),
+            },
+        }
+    }
+
+    fn new_ipc(path: PathBuf) -> Self {
+        Self {
+            transport: RpcTransport::Ipc { path },
         }
     }
 
@@ -95,14 +140,42 @@ impl RpcClient {
             "id": 1
         });
 
-        let resp: serde_json::Value = self
-            .client
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let resp: serde_json::Value = match &self.transport {
+            RpcTransport::Http { url, client } => {
+                client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await?
+                    .json()
+                    .await?
+            }
+            RpcTransport::Ipc { path } => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                use tokio::net::UnixStream;
+
+                let mut stream = UnixStream::connect(path).await?;
+                let request = serde_json::to_string(&body)?;
+                stream.write_all(request.as_bytes()).await?;
+                stream.flush().await?;
+
+                // Read response - IPC returns raw JSON without newlines
+                let mut response = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    response.extend_from_slice(&buf[..n]);
+                    // Try to parse - if successful, we have the complete response
+                    if serde_json::from_slice::<serde_json::Value>(&response).is_ok() {
+                        break;
+                    }
+                }
+                serde_json::from_slice(&response)?
+            }
+        };
 
         if let Some(error) = resp.get("error") {
             return Err(eyre::eyre!("RPC error: {}", error));
@@ -131,6 +204,14 @@ impl RpcClient {
         self.call("eth_getBlockReceipts", serde_json::json!([hex]))
             .await
     }
+
+    async fn call_contract(&self, to: &str, data: &str) -> Result<String> {
+        self.call(
+            "eth_call",
+            serde_json::json!([{"to": to, "data": data}, "latest"]),
+        )
+        .await
+    }
 }
 
 fn parse_log(rpc_log: &RpcLog) -> Option<Log> {
@@ -150,6 +231,348 @@ fn parse_tx_index(tx: &RpcTransaction) -> u32 {
         .as_ref()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
         .unwrap_or(0)
+}
+
+// ============ Direct MDBX Mode ============
+
+#[cfg(feature = "reth")]
+mod direct {
+    use super::*;
+    use alloy_primitives::Log;
+    use blockscout_exex::reth_reader::RethReader;
+
+    pub fn run_direct_backfill(
+        reader: &RethReader,
+        index: &FdbIndex,
+        from_block: u64,
+        to_block: u64,
+        batch_size: u64,
+    ) -> Result<()> {
+        let total = to_block - from_block + 1;
+        let mut processed = 0u64;
+
+        for batch_start in (from_block..=to_block).step_by(batch_size as usize) {
+            let batch_end = (batch_start + batch_size - 1).min(to_block);
+
+            let mut batch = index.write_batch();
+
+            for block_num in batch_start..=batch_end {
+                let Some(block) = reader.block_by_number(block_num)? else {
+                    continue;
+                };
+
+                let receipts = reader.receipts_by_block(block_num)?.unwrap_or_default();
+                let timestamp = block.header().timestamp;
+
+                for (tx_idx, tx) in block.transactions_with_sender().enumerate() {
+                    let (from, tx) = tx;
+                    let tx_hash = tx.tx_hash();
+
+                    // Index by sender
+                    batch.insert_address_tx(*from, tx_hash, block_num, tx_idx as u32);
+
+                    // Index by receiver
+                    if let Some(to) = tx.to() {
+                        batch.insert_address_tx(to, tx_hash, block_num, tx_idx as u32);
+                    }
+
+                    // Index tx → block
+                    batch.insert_tx_block(tx_hash, block_num);
+
+                    // Process logs for token transfers (ERC-20, ERC-721, ERC-1155)
+                    if let Some(receipt) = receipts.get(tx_idx) {
+                        for (log_index, log) in receipt.logs.iter().enumerate() {
+                            let alloy_log = Log::new(log.address, log.topics().to_vec(), log.data.data.clone()).unwrap();
+                            let decoded_transfers = decode_token_transfer(&alloy_log);
+                            for decoded in decoded_transfers {
+                                let transfer = match decoded.token_type {
+                                    TokenType::Erc721 => TokenTransfer::new_erc721(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.token_id.unwrap(),
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                    TokenType::Erc1155 => TokenTransfer::new_erc1155(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.token_id.unwrap(),
+                                        decoded.value,
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                    TokenType::Erc20 => TokenTransfer::new(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.value,
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                };
+                                batch.insert_transfer(transfer);
+                            }
+                        }
+                    }
+                }
+
+                processed += 1;
+                if processed % 1000 == 0 {
+                    let percent = (processed as f64 / total as f64) * 100.0;
+                    info!(
+                        block = block_num,
+                        progress = format!("{:.2}%", percent),
+                        "Progress"
+                    );
+                }
+            }
+
+            // Commit batch synchronously using tokio runtime
+            tokio::runtime::Handle::current().block_on(batch.commit(batch_end))?;
+            debug!(from = batch_start, to = batch_end, "Committed batch");
+        }
+
+        Ok(())
+    }
+}
+
+// ============ JSON-RPC Mode ============
+
+async fn run_rpc_backfill(
+    rpc: &RpcClient,
+    index: &FdbIndex,
+    search: Option<&SearchClient>,
+    chain: &str,
+    from_block: u64,
+    to_block: u64,
+    batch_size: u64,
+) -> Result<()> {
+    let total = to_block - from_block + 1;
+    let mut processed = 0u64;
+    let mut seen_tokens: HashSet<Address> = HashSet::new();
+
+    for batch_start in (from_block..=to_block).step_by(batch_size as usize) {
+        let batch_end = (batch_start + batch_size - 1).min(to_block);
+
+        let mut batch = index.write_batch();
+        let mut new_tokens: Vec<(Address, TokenType)> = Vec::new();
+
+        for block_num in batch_start..=batch_end {
+            let Some(block) = rpc.get_block(block_num).await? else {
+                continue;
+            };
+
+            let receipts = rpc.get_block_receipts(block_num).await?;
+            let timestamp = u64::from_str_radix(block.timestamp.trim_start_matches("0x"), 16)?;
+
+            // Create receipt lookup by tx hash
+            let receipt_map: std::collections::HashMap<_, _> = receipts
+                .into_iter()
+                .map(|r| (r.transaction_hash.clone(), r))
+                .collect();
+
+            let mut block_tx_count = 0i64;
+            let mut block_transfer_count = 0i64;
+
+            for tx in block.transactions {
+                let tx_hash: TxHash = tx.hash.parse()?;
+                let from: Address = tx.from.parse()?;
+                let tx_idx = parse_tx_index(&tx);
+
+                // Index by sender
+                batch.insert_address_tx(from, tx_hash, block_num, tx_idx);
+
+                // Index by receiver
+                if let Some(to_str) = &tx.to {
+                    if let Ok(to) = to_str.parse::<Address>() {
+                        batch.insert_address_tx(to, tx_hash, block_num, tx_idx);
+                    }
+                }
+
+                // Index tx → block
+                batch.insert_tx_block(tx_hash, block_num);
+                block_tx_count += 1;
+
+                // Process logs for token transfers (ERC-20, ERC-721, ERC-1155)
+                if let Some(receipt) = receipt_map.get(&tx.hash) {
+                    for (log_index, rpc_log) in receipt.logs.iter().enumerate() {
+                        if let Some(log) = parse_log(rpc_log) {
+                            let decoded_transfers = decode_token_transfer(&log);
+                            for decoded in decoded_transfers {
+                                let transfer = match decoded.token_type {
+                                    TokenType::Erc721 => TokenTransfer::new_erc721(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.token_id.unwrap(),
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                    TokenType::Erc1155 => TokenTransfer::new_erc1155(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.token_id.unwrap(),
+                                        decoded.value,
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                    TokenType::Erc20 => TokenTransfer::new(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.value,
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                };
+                                batch.insert_transfer(transfer);
+                                block_transfer_count += 1;
+
+                                // Track new tokens for Meilisearch indexing
+                                if !seen_tokens.contains(&decoded.token_address) {
+                                    seen_tokens.insert(decoded.token_address);
+                                    new_tokens.push((decoded.token_address, decoded.token_type));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Record daily metrics for this block
+            batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
+
+            processed += 1;
+            if processed % 1000 == 0 {
+                let percent = (processed as f64 / total as f64) * 100.0;
+                info!(
+                    block = block_num,
+                    progress = format!("{:.2}%", percent),
+                    "Progress"
+                );
+            }
+        }
+
+        batch.commit(batch_end).await?;
+        debug!(from = batch_start, to = batch_end, "Committed batch");
+
+        // Index new tokens to Meilisearch
+        if let Some(search) = search {
+            if !new_tokens.is_empty() {
+                let token_docs = fetch_token_docs(rpc, chain, &new_tokens).await;
+                if !token_docs.is_empty() {
+                    if let Err(e) = search.index_tokens(&token_docs).await {
+                        warn!("Failed to index tokens to Meilisearch: {}", e);
+                    } else {
+                        debug!(count = token_docs.len(), "Indexed tokens to Meilisearch");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_token_docs(rpc: &RpcClient, chain: &str, tokens: &[(Address, TokenType)]) -> Vec<TokenDocument> {
+    let mut docs = Vec::new();
+    
+    for (token, token_type) in tokens {
+        let addr = format!("{:?}", token);
+        let type_str = token_type.as_str();
+        
+        // Only fetch name/symbol/decimals for ERC-20 tokens
+        // NFTs often don't have decimals and may have different metadata patterns
+        let (name, symbol, decimals) = if *token_type == TokenType::Erc20 {
+            fetch_token_metadata_rpc(rpc, &addr).await
+        } else {
+            // For NFTs, try to fetch name and symbol but skip decimals
+            let name = rpc
+                .call_contract(&addr, "0x06fdde03") // name()
+                .await
+                .ok()
+                .and_then(|r| decode_string_result(&r));
+            let symbol = rpc
+                .call_contract(&addr, "0x95d89b41") // symbol()
+                .await
+                .ok()
+                .and_then(|r| decode_string_result(&r));
+            (name, symbol, None)
+        };
+        
+        docs.push(TokenDocument::new(
+            chain,
+            &addr,
+            name,
+            symbol,
+            decimals.and_then(|d| d.parse().ok()),
+            type_str,
+        ));
+    }
+    
+    docs
+}
+
+async fn fetch_token_metadata_rpc(
+    rpc: &RpcClient,
+    token_addr: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let name = rpc
+        .call_contract(token_addr, "0x06fdde03") // name()
+        .await
+        .ok()
+        .and_then(|r| decode_string_result(&r));
+
+    let symbol = rpc
+        .call_contract(token_addr, "0x95d89b41") // symbol()
+        .await
+        .ok()
+        .and_then(|r| decode_string_result(&r));
+
+    let decimals = rpc
+        .call_contract(token_addr, "0x313ce567") // decimals()
+        .await
+        .ok()
+        .map(|r| {
+            let hex = r.trim_start_matches("0x");
+            u64::from_str_radix(hex, 16)
+                .map(|d| d.to_string())
+                .unwrap_or_default()
+        })
+        .filter(|s| !s.is_empty());
+
+    (name, symbol, decimals)
+}
+
+fn decode_string_result(hex: &str) -> Option<String> {
+    let bytes = hex::decode(hex.trim_start_matches("0x")).ok()?;
+    if bytes.len() < 64 {
+        return None;
+    }
+    let offset = usize::from_be_bytes(bytes[24..32].try_into().ok()?);
+    if offset + 32 > bytes.len() {
+        return None;
+    }
+    let len = usize::from_be_bytes(bytes[offset + 24..offset + 32].try_into().ok()?);
+    if offset + 32 + len > bytes.len() {
+        return None;
+    }
+    String::from_utf8(bytes[offset + 32..offset + 32 + len].to_vec()).ok()
 }
 
 #[tokio::main]
@@ -173,9 +596,65 @@ async fn main() -> Result<()> {
         }
     };
 
-    let rpc = RpcClient::new(&args.rpc_url);
+    // Check if using direct MDBX mode
+    #[cfg(feature = "reth")]
+    if let Some(reth_db) = &args.reth_db {
+        let static_files = args
+            .reth_static_files
+            .as_ref()
+            .map(|p| p.clone())
+            .unwrap_or_else(|| reth_db.join("static_files"));
 
-    // Determine block range
+        info!("Opening reth database at {:?}", reth_db);
+        info!("Static files at {:?}", static_files);
+
+        let reader = if args.chain == "sepolia" {
+            blockscout_exex::reth_reader::RethReader::open_sepolia(reth_db, &static_files)?
+        } else {
+            blockscout_exex::reth_reader::RethReader::open_mainnet(reth_db, &static_files)?
+        };
+
+        let from_block = if args.from_block == 0 {
+            index.last_indexed_block().await?.map(|b| b + 1).unwrap_or(0)
+        } else {
+            args.from_block
+        };
+
+        let to_block = if args.to_block == 0 {
+            reader.last_block_number()?.unwrap_or(0)
+        } else {
+            args.to_block
+        };
+
+        info!(from = from_block, to = to_block, mode = "direct MDBX", "Starting backfill");
+
+        direct::run_direct_backfill(&reader, &index, from_block, to_block, args.batch_size)?;
+
+        info!("Backfill complete");
+        return Ok(());
+    }
+
+    // Initialize Meilisearch client if configured
+    let search = if let Some(ref meili_url) = args.meili_url {
+        info!("Connecting to Meilisearch at {}", meili_url);
+        let client = SearchClient::new(meili_url, args.meili_key.as_deref(), "sepolia");
+        if let Err(e) = client.ensure_indexes().await {
+            warn!("Failed to configure Meilisearch indexes: {}", e);
+        }
+        Some(client)
+    } else {
+        None
+    };
+
+    // IPC or HTTP JSON-RPC mode
+    let rpc = if let Some(ipc_path) = &args.ipc_path {
+        info!(mode = "IPC", path = %ipc_path.display(), "Starting backfill");
+        RpcClient::new_ipc(ipc_path.clone())
+    } else {
+        info!(mode = "HTTP", url = %args.rpc_url, "Starting backfill");
+        RpcClient::new_http(&args.rpc_url)
+    };
+
     let from_block = if args.from_block == 0 {
         index.last_indexed_block().await?.map(|b| b + 1).unwrap_or(0)
     } else {
@@ -188,84 +667,18 @@ async fn main() -> Result<()> {
         args.to_block
     };
 
-    info!(from = from_block, to = to_block, "Starting backfill");
+    info!(from = from_block, to = to_block, "Block range");
 
-    let total = to_block - from_block + 1;
-    let mut processed = 0u64;
-
-    for batch_start in (from_block..=to_block).step_by(args.batch_size as usize) {
-        let batch_end = (batch_start + args.batch_size - 1).min(to_block);
-
-        let mut batch = index.write_batch();
-
-        for block_num in batch_start..=batch_end {
-            let Some(block) = rpc.get_block(block_num).await? else {
-                continue;
-            };
-
-            let receipts = rpc.get_block_receipts(block_num).await?;
-            let timestamp = u64::from_str_radix(block.timestamp.trim_start_matches("0x"), 16)?;
-
-            // Create receipt lookup by tx hash
-            let receipt_map: std::collections::HashMap<_, _> = receipts
-                .into_iter()
-                .map(|r| (r.transaction_hash.clone(), r))
-                .collect();
-
-            for tx in block.transactions {
-                let tx_hash: TxHash = tx.hash.parse()?;
-                let from: Address = tx.from.parse()?;
-                let tx_idx = parse_tx_index(&tx);
-
-                // Index by sender
-                batch.insert_address_tx(from, tx_hash, block_num, tx_idx);
-
-                // Index by receiver
-                if let Some(to_str) = &tx.to {
-                    if let Ok(to) = to_str.parse::<Address>() {
-                        batch.insert_address_tx(to, tx_hash, block_num, tx_idx);
-                    }
-                }
-
-                // Index tx → block
-                batch.insert_tx_block(tx_hash, block_num);
-
-                // Process logs for ERC20 transfers
-                if let Some(receipt) = receipt_map.get(&tx.hash) {
-                    for (log_index, rpc_log) in receipt.logs.iter().enumerate() {
-                        if let Some(log) = parse_log(rpc_log) {
-                            if let Some((token, from, to, value)) = decode_erc20_transfer(&log) {
-                                let transfer = TokenTransfer::new(
-                                    tx_hash,
-                                    log_index as u64,
-                                    token,
-                                    from,
-                                    to,
-                                    value,
-                                    block_num,
-                                    timestamp,
-                                );
-                                batch.insert_transfer(transfer);
-                            }
-                        }
-                    }
-                }
-            }
-
-            processed += 1;
-            if processed % 1000 == 0 {
-                let percent = (processed as f64 / total as f64) * 100.0;
-                info!(
-                    block = block_num,
-                    progress = format!("{:.2}%", percent),
-                    "Progress"
-                );
-            }
-        }
-
-        batch.commit(batch_end).await?;
-        debug!(from = batch_start, to = batch_end, "Committed batch");
-    }
+    run_rpc_backfill(
+        &rpc,
+        &index,
+        search.as_ref(),
+        "sepolia",
+        from_block,
+        to_block,
+        args.batch_size,
+    )
+    .await?;
 
     info!("Backfill complete");
     Ok(())

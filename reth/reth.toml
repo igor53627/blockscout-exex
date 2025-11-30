@@ -1,0 +1,22 @@
+# Reth configuration for ~10k block window on mainnet
+# Minimum is 10064 blocks for receipts
+
+[stages.headers]
+downloader_batch_size = 1000
+downloader_max_concurrent_requests = 100
+
+[stages.bodies]
+downloader_batch_size = 1000
+downloader_max_concurrent_requests = 100
+
+[prune]
+# Prune every 100 blocks
+block_interval = 100
+
+[prune.segments]
+# Keep minimum required blocks for each segment
+sender_recovery = { distance = 10064 }
+transaction_lookup = { distance = 10064 }
+receipts = { distance = 10064 }
+account_history = { distance = 10064 }
+storage_history = { distance = 10064 }

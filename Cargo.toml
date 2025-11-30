@@ -40,14 +40,14 @@ hex = "0.4"
 
 # Utils
 eyre = "0.6"
-alloy-primitives = "0.8"
-alloy-sol-types = "0.8"
+alloy-primitives = "1.4"
+alloy-sol-types = "1.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # API server
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tower = "0.5"
 hyper = { version = "1", features = ["server", "http1"] }
@@ -56,13 +56,16 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # WebSocket for live subscription
 tokio-tungstenite = "0.26"
 
+# Search
+meilisearch-sdk = "0.27"
+
 # For reading reth DB directly
-reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
-reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
-reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.0", optional = true }
+reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 chrono = "0.4.42"
 
 [features]

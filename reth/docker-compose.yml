@@ -1,0 +1,96 @@
+services:
+  # Init container to generate JWT secret
+  init:
+    image: alpine
+    container_name: reth-init
+    volumes:
+      - reth-data:/data
+    command: |
+      sh -c "
+        if [ ! -f /data/jwt.hex ]; then
+          echo 'Generating JWT secret...'
+          apk add --no-cache openssl
+          openssl rand -hex 32 > /data/jwt.hex
+          echo 'JWT secret created'
+        else
+          echo 'JWT secret exists'
+        fi
+      "
+    restart: "no"
+
+  reth:
+    image: ghcr.io/paradigmxyz/reth:latest
+    container_name: reth-10k
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - reth-data:/root/.local/share/reth
+      - ./reth.toml:/etc/reth/reth.toml:ro
+    ports:
+      - "8545:8545"   # HTTP RPC
+      - "8546:8546"   # WebSocket
+      - "8551:8551"   # Auth RPC (for consensus client)
+      - "30303:30303" # P2P
+      - "30303:30303/udp"
+      - "9001:9001"   # Metrics
+    command:
+      - node
+      - --chain=sepolia
+      - --full
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=eth,net,web3,debug,trace
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/root/.local/share/reth/jwt.hex
+      - --metrics=0.0.0.0:9001
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  # Lighthouse beacon node - lightweight checkpoint sync
+  lighthouse:
+    image: sigp/lighthouse:latest
+    container_name: lighthouse
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      reth:
+        condition: service_started
+    volumes:
+      - lighthouse-data:/root/.lighthouse
+      - reth-data:/reth-data:ro
+    ports:
+      - "5052:5052"   # HTTP API
+      - "9000:9000"   # P2P
+      - "9000:9000/udp"
+    command:
+      - lighthouse
+      - bn
+      - --network=sepolia
+      - --execution-endpoint=http://reth:8551
+      - --execution-jwt=/reth-data/jwt.hex
+      # Checkpoint sync - start from recent finalized state
+      - --checkpoint-sync-url=https://beaconstate-sepolia.chainsafe.io
+      # HTTP API
+      - --http
+      - --http-address=0.0.0.0
+      - --http-port=5052
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+volumes:
+  reth-data:
+  lighthouse-data:
