@@ -827,19 +827,33 @@ impl<'a> WriteBatch<'a> {
         self.transfers.len()
     }
 
+    /// Check if batch is approaching FDB transaction size limit
+    pub fn is_large(&self) -> bool {
+        // Estimate size: addr_txs ~65 bytes each, transfers ~500 bytes each (3 indexes)
+        // FDB limit is 10MB, we target <5MB to be safe
+        let addr_tx_bytes = self.address_txs.len() * 65;
+        let transfer_bytes = self.transfers.len() * 500;
+        let total = addr_tx_bytes + transfer_bytes;
+        total > 4_000_000 // 4MB threshold
+    }
+
     pub async fn commit(self, last_block: u64) -> Result<()> {
-        const MAX_TRANSFERS_PER_TXN: usize = 3000; // ~1.5MB for transfers, safe limit
+        const MAX_WRITES: usize = 50000; // ~3MB at 60 bytes per write average
+        
+        let total_writes = self.address_txs.len() + self.tx_blocks.len() + (self.transfers.len() * 3);
         
         tracing::debug!(
             transfers = self.transfers.len(),
             txs = self.tx_blocks.len(),
             addr_txs = self.address_txs.len(),
+            total_writes = total_writes,
             "Committing batch"
         );
         
-        // If we have too many transfers, split into multiple transactions
-        if self.transfers.len() > MAX_TRANSFERS_PER_TXN {
-            return self.commit_chunked(last_block, MAX_TRANSFERS_PER_TXN).await;
+        // If we have too many writes, split into multiple transactions
+        if total_writes > MAX_WRITES {
+            tracing::info!(total_writes = total_writes, "Batch too large, chunking");
+            return self.commit_chunked_all(last_block).await;
         }
 
         let address_txs = self.address_txs;
@@ -984,7 +998,63 @@ impl<'a> WriteBatch<'a> {
         Ok(())
     }
 
-    /// Commit a large batch by splitting transfers into chunks
+    /// Commit a large batch by splitting all data into chunks
+    async fn commit_chunked_all(self, last_block: u64) -> Result<()> {
+        const CHUNK_SIZE: usize = 15000; // writes per chunk, ~1MB
+        
+        let total_addr_txs = self.address_txs.len();
+        let total_transfers = self.transfers.len();
+        
+        // Split into chunks
+        let mut addr_tx_iter = self.address_txs.into_iter();
+        let mut tx_block_iter = self.tx_blocks.into_iter();
+        let mut transfer_iter = self.transfers.into_iter();
+        
+        let mut chunk_num = 0;
+        loop {
+            let addr_txs: Vec<_> = addr_tx_iter.by_ref().take(CHUNK_SIZE).collect();
+            let tx_blocks: Vec<_> = tx_block_iter.by_ref().take(CHUNK_SIZE).collect();
+            let transfers: Vec<_> = transfer_iter.by_ref().take(CHUNK_SIZE / 3).collect(); // 3 writes per transfer
+            
+            if addr_txs.is_empty() && tx_blocks.is_empty() && transfers.is_empty() {
+                break;
+            }
+            
+            chunk_num += 1;
+            tracing::debug!(
+                chunk = chunk_num,
+                addr_txs = addr_txs.len(),
+                tx_blocks = tx_blocks.len(),
+                transfers = transfers.len(),
+                "Committing chunk"
+            );
+            
+            Self::commit_chunk(
+                self.db,
+                addr_txs,
+                tx_blocks,
+                transfers,
+                if chunk_num == 1 { self.holder_updates.clone() } else { Vec::new() },
+                if chunk_num == 1 { self.daily_tx_counts.clone().into_iter().collect() } else { Vec::new() },
+                if chunk_num == 1 { self.daily_transfer_counts.clone().into_iter().collect() } else { Vec::new() },
+                if chunk_num == 1 { self.address_tx_increments.clone().into_iter().collect() } else { Vec::new() },
+                if chunk_num == 1 { self.address_transfer_increments.clone().into_iter().collect() } else { Vec::new() },
+                last_block,
+            ).await?;
+        }
+        
+        tracing::info!(
+            chunks = chunk_num,
+            total_addr_txs = total_addr_txs,
+            total_transfers = total_transfers,
+            "Chunked commit complete"
+        );
+        
+        Ok(())
+    }
+
+    /// Commit a large batch by splitting transfers into chunks (legacy, used by single-block large transfers)
+    #[allow(dead_code)]
     async fn commit_chunked(self, last_block: u64, chunk_size: usize) -> Result<()> {
         let num_chunks = (self.transfers.len() + chunk_size - 1) / chunk_size;
         tracing::info!(

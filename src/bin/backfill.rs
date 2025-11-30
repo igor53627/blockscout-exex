@@ -358,10 +358,8 @@ mod direct {
 
                 processed += 1;
                 
-                // Commit when batch reaches size limit (avoid FDB 10MB limit)
-                // Check after each block since single blocks can have 10k+ transfers
-                if batch.transfer_count() >= 4000 {
-                    info!(block = block_num, transfers = batch.transfer_count(), "Committing large batch");
+                // Commit when batch is getting large (avoid FDB 10MB limit)
+                if batch.is_large() {
                     batch.commit(block_num).await?;
                     batch = index.write_batch();
                 }
@@ -538,9 +536,8 @@ async fn run_rpc_backfill(
 
             processed += 1;
             
-            // Commit when batch reaches size limit (avoid FDB 10MB limit)
-            if batch.transfer_count() >= 4000 {
-                info!(block = block_num, transfers = batch.transfer_count(), "Committing large batch");
+            // Commit when batch is getting large (avoid FDB 10MB limit)
+            if batch.is_large() {
                 batch.commit(block_num).await?;
                 batch = index.write_batch();
             }
