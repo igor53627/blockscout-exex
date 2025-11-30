@@ -534,6 +534,12 @@ async fn run_rpc_backfill(
             batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
 
             // Commit per-block to avoid FDB 10MB transaction limit
+            debug!(
+                block = block_num,
+                txs = block_tx_count,
+                transfers = block_transfer_count,
+                "Committing block"
+            );
             batch.commit(block_num).await?;
             batch = index.write_batch();
 
