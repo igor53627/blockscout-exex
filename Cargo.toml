@@ -80,6 +80,7 @@ crossbeam-queue = "0.3"
 # For reading reth DB directly and MDBX support
 reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-db-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-libmdbx = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
@@ -91,7 +92,7 @@ chrono = "0.4.42"
 default = ["fdb"]
 fdb = ["foundationdb"]
 mdbx = ["reth"]
-reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-db-api", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
+reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-db-api", "reth-libmdbx", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
 
 [dev-dependencies]
 tokio-test = "0.4"
