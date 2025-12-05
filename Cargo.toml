@@ -21,7 +21,6 @@ path = "src/bin/api.rs"
 [[bin]]
 name = "blockscout-subscriber"
 path = "src/bin/subscriber.rs"
-required-features = ["fdb"]
 
 [[bin]]
 name = "blockscout-migrate"

@@ -203,7 +203,7 @@ impl AddressTransferKey {
 }
 
 /// Key for token holder mappings: (token, holder)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TokenHolderKey {
     token: Address,
     holder: Address,
@@ -888,6 +888,8 @@ impl MdbxIndex {
             counter_deltas: std::collections::HashMap::new(),
             address_counter_deltas: std::collections::HashMap::new(),
             daily_metrics: Vec::new(),
+            seen_addresses: std::collections::HashSet::new(),
+            batch_balances: std::collections::HashMap::new(),
         }
     }
 
@@ -1010,8 +1012,8 @@ impl MdbxIndex {
     /// Load the address HLL count from MDBX (we store just the count, not full HLL)
     #[cfg(feature = "reth")]
     pub fn load_address_hll_count(&self) -> Result<u64> {
-        // For now, return 0 - will be stored in metadata table
-        Ok(0)
+        // Read from total_addresses counter
+        self.get_total_addresses()
     }
 
     #[cfg(not(feature = "reth"))]
@@ -1021,8 +1023,19 @@ impl MdbxIndex {
 
     /// Save the address HLL count to MDBX
     #[cfg(feature = "reth")]
-    pub fn save_address_hll_count(&self, _count: u64) -> Result<()> {
-        // For now, no-op - will store in metadata table
+    pub fn save_address_hll_count(&self, count: u64) -> Result<()> {
+        let tx = self.env.tx_mut()?;
+        let counters_db = tx.inner.create_db(Some(tables::COUNTERS), DatabaseFlags::default())?;
+
+        // Store the HLL count as total_addresses counter
+        tx.inner.put(
+            counters_db.dbi(),
+            b"total_addresses",
+            &(count as i64).to_le_bytes(),
+            WriteFlags::UPSERT
+        )?;
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -1108,6 +1121,11 @@ pub struct MdbxWriteBatch {
     address_counter_deltas: std::collections::HashMap<AddressCounterKey, i64>,
     #[cfg(feature = "reth")]
     daily_metrics: Vec<(DailyMetricKey, i64)>,
+    #[cfg(feature = "reth")]
+    seen_addresses: std::collections::HashSet<Address>,
+    #[cfg(feature = "reth")]
+    /// Track balances within this batch for holder count calculations
+    batch_balances: std::collections::HashMap<TokenHolderKey, alloy_primitives::U256>,
     #[cfg(not(feature = "reth"))]
     _phantom: std::marker::PhantomData<()>,
 }
@@ -1124,16 +1142,98 @@ impl MdbxWriteBatch {
     ) {
         let key = AddressTxKey::new(address, block, tx_idx);
         self.address_txs.push((key, tx_hash));
+
+        // Increment per-address transaction counter (kind=0 for txs)
+        self.increment_address_counter(address, 0, 1);
+
+        // Track address for HLL (total_addresses is managed by HLL in backfill code)
+        self.seen_addresses.insert(address);
     }
 
     /// Insert a transaction -> block mapping
     pub fn insert_tx_block(&mut self, tx_hash: alloy_primitives::TxHash, block: u64) {
         self.tx_blocks.push((tx_hash, block));
+
+        // Increment total_txs counter (this is called once per transaction)
+        self.increment_counter(b"total_txs", 1);
     }
 
     /// Insert a token transfer
     pub fn insert_transfer(&mut self, transfer: TokenTransfer) {
+        // Increment total_transfers counter
+        self.increment_counter(b"total_transfers", 1);
+
+        // Increment per-address transfer counters (kind=1 for transfers)
+        let from_addr = Address::from_slice(&transfer.from);
+        let to_addr = Address::from_slice(&transfer.to);
+
+        self.increment_address_counter(from_addr, 1, 1);
+        // Only count 'to' address if different from 'from' to avoid double-counting self-transfers
+        if from_addr != to_addr {
+            self.increment_address_counter(to_addr, 1, 1);
+        }
+
+        // Track unique addresses (will be counted during commit)
+        self.seen_addresses.insert(from_addr);
+        self.seen_addresses.insert(to_addr);
+
+        // Update holder balances for token holder count tracking
+        // Note: This is a simplified implementation that works correctly for:
+        // - ERC-721: Each transfer is 1 NFT (token_type=1)
+        // - ERC-20/ERC-1155: Requires full balance tracking (not yet implemented)
+        let token_addr = Address::from_slice(&transfer.token_address);
+
+        // For ERC-721, we can track holder changes simply
+        if transfer.token_type == 1 {  // ERC-721
+            // From address loses 1 token
+            let from_key = TokenHolderKey::new(token_addr, from_addr);
+            let from_balance = self.get_or_fetch_balance(&from_key);
+            let new_from_balance = from_balance.saturating_sub(alloy_primitives::U256::from(1));
+            self.update_holder_balance(token_addr, from_addr, new_from_balance, Some(from_balance));
+
+            // To address gains 1 token
+            let to_key = TokenHolderKey::new(token_addr, to_addr);
+            let to_balance = self.get_or_fetch_balance(&to_key);
+            let new_to_balance = to_balance + alloy_primitives::U256::from(1);
+            self.update_holder_balance(token_addr, to_addr, new_to_balance, Some(to_balance));
+        }
+        // For ERC-20 (token_type=0) and ERC-1155 (token_type=2), we need full balance tracking
+        // which requires reading current balances from the database. This is not implemented yet
+        // to avoid performance overhead. Holder counts for these token types will be inaccurate
+        // until we implement a separate balance tracking mechanism.
+
         self.transfers.push(transfer);
+    }
+
+    /// Get balance from batch cache or fetch from database
+    fn get_or_fetch_balance(&mut self, key: &TokenHolderKey) -> alloy_primitives::U256 {
+        // First check if we've already tracked this balance in the batch
+        if let Some(&balance) = self.batch_balances.get(key) {
+            return balance;
+        }
+
+        // Otherwise, fetch from database
+        let tx = self.env.tx().ok();
+        let balance = if let Some(tx) = tx {
+            let holders_db = tx.inner.open_db(Some(tables::TOKEN_HOLDERS)).ok();
+            if let Some(holders_db) = holders_db {
+                let key_bytes = key.encode();
+                match tx.inner.get::<Vec<u8>>(holders_db.dbi(), key_bytes.as_slice()) {
+                    Ok(Some(bytes)) if bytes.len() >= 32 => {
+                        alloy_primitives::U256::from_be_slice(&bytes[..32])
+                    }
+                    _ => alloy_primitives::U256::ZERO,
+                }
+            } else {
+                alloy_primitives::U256::ZERO
+            }
+        } else {
+            alloy_primitives::U256::ZERO
+        };
+
+        // Cache the balance for future lookups in this batch
+        self.batch_balances.insert(key.clone(), balance);
+        balance
     }
 
     /// Update a holder's balance
@@ -1145,7 +1245,9 @@ impl MdbxWriteBatch {
         old_balance: Option<alloy_primitives::U256>,
     ) {
         let key = TokenHolderKey::new(token, holder);
-        self.holder_updates.push((key, new_balance, old_balance));
+        self.holder_updates.push((key.clone(), new_balance, old_balance));
+        // Update the batch balance cache so subsequent lookups see the new balance
+        self.batch_balances.insert(key, new_balance);
     }
 
     /// Increment a counter

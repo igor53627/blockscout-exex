@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, U256 as AlloyU256};
 #[cfg(feature = "reth")]
@@ -10,6 +11,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
@@ -21,6 +23,26 @@ use crate::reth_reader::RethReader;
 use crate::rpc_executor::RpcExecutor;
 use crate::websocket::{websocket_handler, Broadcaster};
 
+// Cache entry with timestamp
+#[derive(Clone, Debug)]
+pub struct CachedValue<T> {
+    value: T,
+    timestamp: Instant,
+}
+
+impl<T> CachedValue<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value,
+            timestamp: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self, ttl: Duration) -> bool {
+        self.timestamp.elapsed() > ttl
+    }
+}
+
 pub struct ApiState {
     pub index: Arc<dyn IndexDatabase>,
     #[cfg(feature = "reth")]
@@ -29,6 +51,9 @@ pub struct ApiState {
     pub rpc_url: Option<String>,
     pub search: Option<SearchClient>,
     pub rpc_executor: Option<Arc<RpcExecutor>>,
+    // Price caches (TTL: 30 seconds)
+    pub gas_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
+    pub coin_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,29 +150,33 @@ async fn stats(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         std::time::Duration::from_secs(2),
         state.index.get_total_txs()
     ).await.unwrap_or(Ok(0)).unwrap_or(0);
-    
+
     let total_transfers = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         state.index.get_total_transfers()
     ).await.unwrap_or(Ok(0)).unwrap_or(0);
-    
+
     // Use total addresses count
     let total_addresses = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         state.index.get_total_addresses()
     ).await.unwrap_or(Ok(0)).unwrap_or(0);
 
+    // Fetch gas price and coin price if RPC is available
+    let gas_prices = get_gas_price(&state).await;
+    let coin_price = get_coin_price(&state).await;
+
     Json(json!({
         "total_blocks": last_block.to_string(),
         "total_addresses": total_addresses.to_string(),
         "total_transactions": total_txs.to_string(),
         "average_block_time": 12000.0,
-        "coin_price": null,
+        "coin_price": coin_price,
         "coin_price_change_percentage": null,
         "total_gas_used": "0",
         "transactions_today": null,
         "gas_used_today": "0",
-        "gas_prices": null,
+        "gas_prices": gas_prices,
         "gas_price_updated_at": null,
         "gas_prices_update_in": 0,
         "static_gas_price": null,
@@ -1884,6 +1913,171 @@ async fn execute_rpc_call(
         resp.get("result")
             .cloned()
             .ok_or_else(|| eyre::eyre!("No result in RPC response"))
+    }
+}
+
+/// Fetch current gas price from RPC (eth_gasPrice)
+async fn fetch_gas_price_rpc(rpc_url: &str) -> Result<String, eyre::Report> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "eth_gasPrice",
+            "params": [],
+            "id": 1
+        }))
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+
+    if let Some(error) = resp.get("error") {
+        return Err(eyre::eyre!("RPC error: {}", error));
+    }
+
+    let gas_price_hex = resp["result"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("Invalid gas price response"))?;
+
+    // Convert hex to decimal string (in wei)
+    let gas_price_wei = hex_to_u256(gas_price_hex);
+    Ok(gas_price_wei)
+}
+
+/// Fetch ETH/USD price from Chainlink oracle via eth_call
+/// Sepolia: 0x694AA1769357215DE4FAC081bf1f309aDC325306
+/// Mainnet: 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419
+async fn fetch_chainlink_price_rpc(rpc_url: &str, oracle_address: &str) -> Result<String, eyre::Report> {
+    let client = reqwest::Client::new();
+
+    // latestRoundData() function selector: 0xfeaf968c
+    let selector = "0xfeaf968c";
+
+    let resp = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": oracle_address,
+                    "data": selector
+                },
+                "latest"
+            ],
+            "id": 1
+        }))
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+
+    if let Some(error) = resp.get("error") {
+        return Err(eyre::eyre!("RPC error: {}", error));
+    }
+
+    let result_hex = resp["result"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("Invalid Chainlink response"))?;
+
+    // Parse the result: latestRoundData returns (roundId, answer, startedAt, updatedAt, answeredInRound)
+    // Each value is 32 bytes (64 hex chars)
+    // We need the 2nd value (answer) which starts at byte 32 (char 64)
+    let result = result_hex.trim_start_matches("0x");
+    if result.len() < 128 {
+        return Err(eyre::eyre!("Invalid Chainlink response length"));
+    }
+
+    // Extract answer (2nd 32-byte value)
+    let answer_hex = &result[64..128];
+    let answer_raw = i128::from_str_radix(answer_hex, 16)
+        .map_err(|_| eyre::eyre!("Failed to parse Chainlink answer"))?;
+
+    // Chainlink price feeds return values with 8 decimals
+    // Convert to USD with 2 decimal places
+    let price_usd = (answer_raw as f64) / 100_000_000.0;
+
+    Ok(format!("{:.2}", price_usd))
+}
+
+/// Get cached gas price or fetch from RPC
+async fn get_gas_price(state: &ApiState) -> Option<Value> {
+    let rpc_url = state.rpc_url.as_ref()?;
+
+    // Check cache first
+    let cache_ttl = Duration::from_secs(30);
+    {
+        let cache = state.gas_price_cache.read();
+        if let Some(cached) = cache.as_ref() {
+            if !cached.is_expired(cache_ttl) {
+                return Some(json!({
+                    "average": cached.value,
+                    "fast": cached.value,
+                    "slow": cached.value
+                }));
+            }
+        }
+    }
+
+    // Fetch from RPC
+    match fetch_gas_price_rpc(rpc_url).await {
+        Ok(gas_price) => {
+            // Update cache
+            {
+                let mut cache = state.gas_price_cache.write();
+                *cache = Some(CachedValue::new(gas_price.clone()));
+            }
+            Some(json!({
+                "average": gas_price,
+                "fast": gas_price,
+                "slow": gas_price
+            }))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch gas price: {}", e);
+            None
+        }
+    }
+}
+
+/// Get cached ETH price or fetch from Chainlink oracle
+async fn get_coin_price(state: &ApiState) -> Option<String> {
+    let rpc_url = state.rpc_url.as_ref()?;
+
+    // Check cache first
+    let cache_ttl = Duration::from_secs(30);
+    {
+        let cache = state.coin_price_cache.read();
+        if let Some(cached) = cache.as_ref() {
+            if !cached.is_expired(cache_ttl) {
+                return Some(cached.value.clone());
+            }
+        }
+    }
+
+    // Determine oracle address based on chain (simple heuristic)
+    // You may want to make this configurable via CLI args
+    let oracle_address = if rpc_url.contains("sepolia") {
+        "0x694AA1769357215DE4FAC081bf1f309aDC325306" // Sepolia
+    } else {
+        "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419" // Mainnet
+    };
+
+    // Fetch from Chainlink
+    match fetch_chainlink_price_rpc(rpc_url, oracle_address).await {
+        Ok(price) => {
+            // Update cache
+            {
+                let mut cache = state.coin_price_cache.write();
+                *cache = Some(CachedValue::new(price.clone()));
+            }
+            Some(price)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch Chainlink price: {}", e);
+            None
+        }
     }
 }
 

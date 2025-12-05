@@ -432,7 +432,7 @@ fn test_write_batch_deferred_operations() {
     // Insert operations should not write immediately
     batch.insert_address_tx(address, tx_hash, 100, 0);
     batch.insert_tx_block(tx_hash, 100);
-    batch.increment_counter(b"total_txs", 1);
+    // Note: total_txs is now auto-incremented by insert_tx_block()
 
     // Data should not be visible before commit
     let txs = index.get_address_txs(&address, 10, 0).unwrap();
@@ -844,8 +844,7 @@ fn test_batch_commit_atomicity() {
     batch.insert_transfer(transfer);
 
     batch.update_holder_balance(token, to, U256::from(1000u64), None);
-    batch.increment_counter(b"total_txs", 1);
-    batch.increment_counter(b"total_transfers", 1);
+    // Note: total_txs and total_transfers are now auto-incremented by insert_tx_block() and insert_transfer()
 
     // Commit should be atomic
     batch.commit(100).unwrap();
@@ -897,7 +896,7 @@ fn test_large_batch_commit() {
 
         batch.insert_transfer(transfer);
         batch.insert_address_tx(from, tx_hash, 100 + (i / 10) as u64, (i % 10) as u32);
-        batch.increment_counter(b"total_transfers", 1);
+        // Note: total_transfers is now auto-incremented by insert_transfer()
     }
 
     // Should handle large batch
