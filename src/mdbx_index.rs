@@ -400,6 +400,32 @@ impl MdbxIndex {
         ))
     }
 
+    /// Open an MDBX database in read-only mode
+    ///
+    /// This allows concurrent reads while another process is writing.
+    /// Use this for the API server when backfill is running.
+    #[cfg(feature = "reth")]
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        const GIGABYTE: usize = 1024 * 1024 * 1024;
+
+        let args = DatabaseArguments::new(ClientVersion::default())
+            .with_max_readers(Some(256))
+            .with_geometry_max_size(Some(1024 * GIGABYTE));
+
+        let env = DatabaseEnv::open(path, DatabaseEnvKind::RO, args)?;
+
+        Ok(Self {
+            env: Arc::new(env),
+        })
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn open_readonly(_path: &Path) -> Result<Self> {
+        Err(eyre::eyre!(
+            "MDBX support requires 'reth' feature to be enabled"
+        ))
+    }
+
     /// Get schema version from metadata
     /// Returns 1 for new databases or stored version
     #[cfg(feature = "reth")]

@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
     let index: Arc<dyn IndexDatabase> = {
         #[cfg(feature = "mdbx")]
         if let Some(mdbx_path) = &args.mdbx_path {
-            tracing::info!("Using MDBX backend at: {:?}", mdbx_path);
-            Arc::new(MdbxIndex::open(mdbx_path)?)
+            tracing::info!("Using MDBX backend (read-only) at: {:?}", mdbx_path);
+            Arc::new(MdbxIndex::open_readonly(mdbx_path)?)
         } else {
             #[cfg(feature = "fdb")]
             {
