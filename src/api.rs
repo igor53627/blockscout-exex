@@ -2003,6 +2003,13 @@ async fn fetch_chainlink_price_rpc(rpc_url: &str, oracle_address: &str) -> Resul
     Ok(format!("{:.2}", price_usd))
 }
 
+/// Convert wei string to Gwei float (rounded to 2 decimals)
+fn wei_to_gwei(wei_str: &str) -> f64 {
+    let wei: u128 = wei_str.parse().unwrap_or(0);
+    let gwei = wei as f64 / 1_000_000_000.0;
+    (gwei * 100.0).round() / 100.0
+}
+
 /// Get cached gas price or fetch from RPC
 async fn get_gas_price(state: &ApiState) -> Option<Value> {
     let rpc_url = state.rpc_url.as_ref()?;
@@ -2013,10 +2020,11 @@ async fn get_gas_price(state: &ApiState) -> Option<Value> {
         let cache = state.gas_price_cache.read();
         if let Some(cached) = cache.as_ref() {
             if !cached.is_expired(cache_ttl) {
+                let gwei = wei_to_gwei(&cached.value);
                 return Some(json!({
-                    "average": cached.value,
-                    "fast": cached.value,
-                    "slow": cached.value
+                    "average": gwei,
+                    "fast": gwei,
+                    "slow": gwei
                 }));
             }
         }
@@ -2024,16 +2032,18 @@ async fn get_gas_price(state: &ApiState) -> Option<Value> {
 
     // Fetch from RPC
     match fetch_gas_price_rpc(rpc_url).await {
-        Ok(gas_price) => {
-            // Update cache
+        Ok(gas_price_wei) => {
+            // Update cache (store wei)
             {
                 let mut cache = state.gas_price_cache.write();
-                *cache = Some(CachedValue::new(gas_price.clone()));
+                *cache = Some(CachedValue::new(gas_price_wei.clone()));
             }
+            // Return as Gwei
+            let gwei = wei_to_gwei(&gas_price_wei);
             Some(json!({
-                "average": gas_price,
-                "fast": gas_price,
-                "slow": gas_price
+                "average": gwei,
+                "fast": gwei,
+                "slow": gwei
             }))
         }
         Err(e) => {
