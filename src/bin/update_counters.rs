@@ -30,8 +30,7 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "mdbx")]
     {
-        use blockscout_exex::mdbx_index::MdbxIndex;
-        use reth_libmdbx::{Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode};
+        use reth_libmdbx::{Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode, DatabaseFlags, WriteFlags};
 
         // Open in read-write mode
         let env = Environment::builder()
@@ -103,10 +102,10 @@ async fn main() -> Result<()> {
         }
         info!("Total transfers: {}", transfer_count);
 
-        // Get last indexed block from IndexingStatus
+        // Get last indexed block from Metadata
         let meta_db = txn.open_db(Some("Metadata"))?;
-        let last_block: u64 = txn.get(&meta_db, b"last_indexed_block")?
-            .map(|v: &[u8]| {
+        let last_block: u64 = txn.get::<[u8]>(&meta_db, b"last_block")?
+            .map(|v| {
                 if v.len() >= 8 {
                     u64::from_be_bytes(v[0..8].try_into().unwrap_or([0u8; 8]))
                 } else {
@@ -121,11 +120,11 @@ async fn main() -> Result<()> {
         // Now write counters
         info!("Writing counters...");
         let txn = env.begin_rw_txn()?;
-        let meta_db = txn.open_db(Some("Metadata"))?;
+        let meta_db = txn.create_db(Some("Metadata"), DatabaseFlags::default())?;
 
-        txn.put(&meta_db, b"total_txs", &tx_count.to_be_bytes(), reth_libmdbx::WriteFlags::UPSERT)?;
-        txn.put(&meta_db, b"total_addresses", &addr_count.to_be_bytes(), reth_libmdbx::WriteFlags::UPSERT)?;
-        txn.put(&meta_db, b"total_transfers", &transfer_count.to_be_bytes(), reth_libmdbx::WriteFlags::UPSERT)?;
+        txn.put(meta_db.dbi(), b"total_txs", &tx_count.to_be_bytes(), WriteFlags::UPSERT)?;
+        txn.put(meta_db.dbi(), b"total_addresses", &addr_count.to_be_bytes(), WriteFlags::UPSERT)?;
+        txn.put(meta_db.dbi(), b"total_transfers", &transfer_count.to_be_bytes(), WriteFlags::UPSERT)?;
 
         txn.commit()?;
 
