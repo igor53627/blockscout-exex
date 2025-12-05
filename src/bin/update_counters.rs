@@ -73,15 +73,23 @@ async fn main() -> Result<()> {
         let mut addr_count: u64 = 0;
         {
             let mut cursor = txn.cursor(&addr_txs_db)?;
-            while let Some((key, _)) = cursor.next::<[u8], ()>()? {
-                if key.len() >= 20 {
-                    let addr: [u8; 20] = key[0..20].try_into().unwrap_or([0u8; 20]);
-                    if last_addr.as_ref() != Some(&addr) {
-                        addr_count += 1;
-                        last_addr = Some(addr);
-                        if addr_count % 100_000 == 0 {
-                            info!("  Counted {} addresses...", addr_count);
+            // Position at first entry
+            if cursor.first::<(), ()>()?.is_some() {
+                loop {
+                    if let Some((key, _)) = cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                        if key.len() >= 20 {
+                            let addr: [u8; 20] = key[0..20].try_into().unwrap_or([0u8; 20]);
+                            if last_addr.as_ref() != Some(&addr) {
+                                addr_count += 1;
+                                last_addr = Some(addr);
+                                if addr_count % 100_000 == 0 {
+                                    info!("  Counted {} addresses...", addr_count);
+                                }
+                            }
                         }
+                    }
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
                     }
                 }
             }
@@ -104,15 +112,12 @@ async fn main() -> Result<()> {
 
         // Get last indexed block from Metadata
         let meta_db = txn.open_db(Some("Metadata"))?;
-        let last_block: u64 = txn.get::<[u8]>(&meta_db, b"last_block")?
-            .map(|v| {
-                if v.len() >= 8 {
-                    u64::from_be_bytes(v[0..8].try_into().unwrap_or([0u8; 8]))
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
+        let last_block: u64 = match txn.get::<Vec<u8>>(meta_db.dbi(), b"last_block") {
+            Ok(Some(v)) if v.len() >= 8 => {
+                u64::from_be_bytes(v[0..8].try_into().unwrap_or([0u8; 8]))
+            }
+            _ => 0,
+        };
         info!("Last indexed block: {}", last_block);
 
         drop(txn);
