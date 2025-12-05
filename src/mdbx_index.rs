@@ -444,8 +444,21 @@ impl MdbxIndex {
     /// Get last indexed block from metadata
     #[cfg(feature = "reth")]
     pub fn get_last_indexed_block(&self) -> Result<Option<u64>> {
-        // For now, return None until we implement proper metadata storage
-        Ok(None)
+        let tx = self.env.tx()?;
+
+        // Try to open metadata table (may not exist yet)
+        let metadata_db = match tx.inner.open_db(Some(tables::METADATA)) {
+            Ok(db) => db,
+            Err(_) => return Ok(None), // Table doesn't exist yet
+        };
+
+        match tx.inner.get::<Vec<u8>>(metadata_db.dbi(), b"last_block") {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                let block = u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                Ok(Some(block))
+            }
+            _ => Ok(None),
+        }
     }
 
     #[cfg(not(feature = "reth"))]
@@ -498,12 +511,63 @@ impl MdbxIndex {
     #[cfg(feature = "reth")]
     pub fn get_address_txs(
         &self,
-        _address: &Address,
-        _limit: usize,
-        _offset: usize,
+        address: &Address,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<alloy_primitives::TxHash>> {
-        // For now, return empty vec until we implement proper table access
-        Ok(Vec::new())
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let addr_txs_db = match tx.inner.open_db(Some(tables::ADDRESS_TXS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()), // Table doesn't exist yet
+        };
+
+        let mut cursor = tx.inner.cursor(&addr_txs_db)?;
+
+        // Seek to the address prefix (address is 20 bytes at start of key)
+        let prefix = address.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        // Position cursor at or after the first key with this address prefix
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        // Iterate through entries with matching prefix
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    // Check if key still has our address prefix
+                    if key.len() < 20 || &key[..20] != prefix {
+                        break; // Different address, we're done
+                    }
+
+                    // Handle offset/limit
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        // Value is the tx_hash (32 bytes)
+                        if value.len() >= 32 {
+                            let tx_hash = alloy_primitives::TxHash::from_slice(&value[..32]);
+                            results.push(tx_hash);
+                        }
+                    } else {
+                        break; // Reached limit
+                    }
+
+                    // Move to next entry
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
     }
 
     #[cfg(not(feature = "reth"))]
@@ -520,11 +584,56 @@ impl MdbxIndex {
     #[cfg(feature = "reth")]
     pub fn get_address_transfers(
         &self,
-        _address: &Address,
-        _limit: usize,
-        _offset: usize,
+        address: &Address,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<TokenTransfer>> {
-        Ok(Vec::new())
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let addr_transfers_db = match tx.inner.open_db(Some(tables::ADDRESS_TRANSFERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut cursor = tx.inner.cursor(&addr_transfers_db)?;
+
+        let prefix = address.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    if key.len() < 20 || &key[..20] != prefix {
+                        break;
+                    }
+
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        // Deserialize the transfer
+                        if let Ok(transfer) = bincode::deserialize::<TokenTransfer>(&value) {
+                            results.push(transfer);
+                        }
+                    } else {
+                        break;
+                    }
+
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
     }
 
     #[cfg(not(feature = "reth"))]
@@ -541,11 +650,64 @@ impl MdbxIndex {
     #[cfg(feature = "reth")]
     pub fn get_token_holders(
         &self,
-        _token: &Address,
-        _limit: usize,
-        _offset: usize,
+        token: &Address,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<(Address, alloy_primitives::U256)>> {
-        Ok(Vec::new())
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let token_holders_db = match tx.inner.open_db(Some(tables::TOKEN_HOLDERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut cursor = tx.inner.cursor(&token_holders_db)?;
+
+        // Key is (token:20, holder:20), value is balance:32
+        let prefix = token.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    // Key must be 40 bytes (token:20 + holder:20)
+                    if key.len() < 40 || &key[..20] != prefix {
+                        break;
+                    }
+
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        // Extract holder address from key
+                        let holder = Address::from_slice(&key[20..40]);
+                        // Balance is stored as big-endian U256
+                        if value.len() >= 32 {
+                            let balance = alloy_primitives::U256::from_be_slice(&value[..32]);
+                            // Only include non-zero balances
+                            if balance > alloy_primitives::U256::ZERO {
+                                results.push((holder, balance));
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
     }
 
     #[cfg(not(feature = "reth"))]
@@ -562,11 +724,55 @@ impl MdbxIndex {
     #[cfg(feature = "reth")]
     pub fn get_token_transfers(
         &self,
-        _token: &Address,
-        _limit: usize,
-        _offset: usize,
+        token: &Address,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<TokenTransfer>> {
-        Ok(Vec::new())
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let token_transfers_db = match tx.inner.open_db(Some(tables::TOKEN_TRANSFERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut cursor = tx.inner.cursor(&token_transfers_db)?;
+
+        let prefix = token.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    if key.len() < 20 || &key[..20] != prefix {
+                        break;
+                    }
+
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        if let Ok(transfer) = bincode::deserialize::<TokenTransfer>(&value) {
+                            results.push(transfer);
+                        }
+                    } else {
+                        break;
+                    }
+
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
     }
 
     #[cfg(not(feature = "reth"))]
@@ -581,8 +787,21 @@ impl MdbxIndex {
 
     /// Get block number for a transaction hash
     #[cfg(feature = "reth")]
-    pub fn get_tx_block(&self, _tx_hash: &alloy_primitives::TxHash) -> Result<Option<u64>> {
-        Ok(None)
+    pub fn get_tx_block(&self, tx_hash: &alloy_primitives::TxHash) -> Result<Option<u64>> {
+        let tx = self.env.tx()?;
+
+        let tx_blocks_db = match tx.inner.open_db(Some(tables::TX_BLOCKS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(None),
+        };
+
+        match tx.inner.get::<Vec<u8>>(tx_blocks_db.dbi(), tx_hash.as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                let block = u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                Ok(Some(block))
+            }
+            _ => Ok(None),
+        }
     }
 
     #[cfg(not(feature = "reth"))]
@@ -593,7 +812,7 @@ impl MdbxIndex {
     /// Get total transaction count
     #[cfg(feature = "reth")]
     pub fn get_total_txs(&self) -> Result<u64> {
-        Ok(0)
+        self.get_counter(b"total_txs").map(|c| c as u64)
     }
 
     #[cfg(not(feature = "reth"))]
@@ -604,7 +823,7 @@ impl MdbxIndex {
     /// Get total transfer count
     #[cfg(feature = "reth")]
     pub fn get_total_transfers(&self) -> Result<u64> {
-        Ok(0)
+        self.get_counter(b"total_transfers").map(|c| c as u64)
     }
 
     #[cfg(not(feature = "reth"))]
@@ -615,7 +834,7 @@ impl MdbxIndex {
     /// Get total unique address count
     #[cfg(feature = "reth")]
     pub fn get_total_addresses(&self) -> Result<u64> {
-        Ok(0)
+        self.get_counter(b"total_addresses").map(|c| c as u64)
     }
 
     #[cfg(not(feature = "reth"))]
@@ -651,9 +870,20 @@ impl MdbxIndex {
 
     /// Get counter value
     #[cfg(feature = "reth")]
-    pub fn get_counter(&self, _name: &[u8]) -> Result<i64> {
-        // Placeholder implementation
-        Ok(0)
+    pub fn get_counter(&self, name: &[u8]) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let counters_db = match tx.inner.open_db(Some(tables::COUNTERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        match tx.inner.get::<Vec<u8>>(counters_db.dbi(), name) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
     }
 
     #[cfg(not(feature = "reth"))]
@@ -663,9 +893,21 @@ impl MdbxIndex {
 
     /// Get address counter
     #[cfg(feature = "reth")]
-    pub fn get_address_counter(&self, _address: &Address, _kind: u8) -> Result<i64> {
-        // Placeholder implementation
-        Ok(0)
+    pub fn get_address_counter(&self, address: &Address, kind: u8) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let addr_counters_db = match tx.inner.open_db(Some(tables::ADDRESS_COUNTERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        let key = AddressCounterKey::new(*address, kind);
+        match tx.inner.get::<Vec<u8>>(addr_counters_db.dbi(), key.encode().as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
     }
 
     #[cfg(not(feature = "reth"))]
@@ -675,9 +917,20 @@ impl MdbxIndex {
 
     /// Get token holder count
     #[cfg(feature = "reth")]
-    pub fn get_token_holder_count(&self, _token: &Address) -> Result<i64> {
-        // Placeholder implementation
-        Ok(0)
+    pub fn get_token_holder_count(&self, token: &Address) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let holder_counts_db = match tx.inner.open_db(Some(tables::TOKEN_HOLDER_COUNTS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        match tx.inner.get::<Vec<u8>>(holder_counts_db.dbi(), token.as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
     }
 
     #[cfg(not(feature = "reth"))]
