@@ -27,6 +27,10 @@ name = "blockscout-migrate"
 path = "src/bin/migrate.rs"
 required-features = ["fdb"]
 
+[[bin]]
+name = "update-counters"
+path = "src/bin/update_counters.rs"
+
 [dependencies]
 # Database - FoundationDB for distributed key-value storage
 foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_1"], optional = true }
