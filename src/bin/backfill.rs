@@ -296,6 +296,8 @@ mod direct_mdbx {
         let mut address_hll = MdbxIndex::new_address_hll();
         let prev_count = index.load_address_hll_count().unwrap_or(0);
         info!("Starting address HLL (previous count: ~{})", prev_count);
+        info!("Total blocks to process: {}", total);
+        info!("Commit frequency: every 100 blocks");
         let mut hll_save_counter = 0u64;
         const HLL_SAVE_INTERVAL: u64 = 10000;
 
@@ -387,8 +389,9 @@ mod direct_mdbx {
 
                 processed += 1;
 
-                // Commit when batch is getting large
-                if batch.is_large() {
+                // Commit every 100 blocks or when batch is large to avoid memory buildup
+                let should_commit = processed % 100 == 0 || batch.is_large();
+                if should_commit {
                     for addr in batch.collect_addresses() {
                         address_hll.insert(&AddressWrapper(addr));
                     }
@@ -396,7 +399,7 @@ mod direct_mdbx {
                     batch = index.write_batch();
                 }
 
-                if processed % 1000 == 0 {
+                if processed % 100 == 0 {
                     let percent = (processed as f64 / total as f64) * 100.0;
                     info!(
                         block = block_num,
