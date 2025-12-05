@@ -16,9 +16,11 @@ use eyre::Result;
 
 mod api;
 mod fdb_index;
+mod meili;
 #[cfg(feature = "reth")]
 mod reth_reader;
 mod transform;
+mod websocket;
 
 #[derive(Parser)]
 #[command(name = "blockscout-exex")]
@@ -43,6 +45,10 @@ enum Commands {
         /// Reth static files path (required if reth_db is set)
         #[arg(long)]
         reth_static_files: Option<String>,
+
+        /// Chain: mainnet or sepolia (default: mainnet)
+        #[arg(long, default_value = "mainnet")]
+        chain: String,
 
         /// API server port
         #[arg(long, default_value = "3000")]
@@ -77,6 +83,10 @@ async fn main() -> Result<()> {
             reth_db: _,
             #[cfg(not(feature = "reth"))]
             reth_static_files: _,
+            #[cfg(feature = "reth")]
+            chain,
+            #[cfg(not(feature = "reth"))]
+            chain: _,
             port,
         } => {
             let index = match cluster_file {
@@ -93,7 +103,12 @@ async fn main() -> Result<()> {
             #[cfg(feature = "reth")]
             let reth = if let (Some(db_path), Some(static_path)) = (reth_db, reth_static_files) {
                 tracing::info!("Opening reth DB at {} with static files at {}", db_path, static_path);
-                Some(reth_reader::RethReader::open(&db_path, &static_path)?)
+                let reader = if chain == "sepolia" {
+                    reth_reader::RethReader::open_sepolia(&db_path, &static_path)?
+                } else {
+                    reth_reader::RethReader::open_mainnet(&db_path, &static_path)?
+                };
+                Some(reader)
             } else {
                 None
             };
@@ -102,6 +117,9 @@ async fn main() -> Result<()> {
                 index,
                 #[cfg(feature = "reth")]
                 reth,
+                broadcaster: websocket::create_broadcaster(),
+                rpc_url: None,
+                search: None,
             });
             let router = api::create_router(state);
 

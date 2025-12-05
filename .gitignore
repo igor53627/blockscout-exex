@@ -3,3 +3,8 @@ Cargo.lock
 *.redb
 blockscout-index/
 .DS_Store
+
+# Deployment
+deploy/
+*.env.local
+*.service

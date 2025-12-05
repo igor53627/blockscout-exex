@@ -1,0 +1,19 @@
+[Unit]
+Description=Blockscout Live Block Subscriber
+After=network.target foundationdb.service blockscout-api.service
+Wants=blockscout-api.service
+
+[Service]
+Type=simple
+User=root
+Environment=RUST_LOG=info
+ExecStart=/mnt/sepolia/blockscout-exex/bin/blockscout-subscriber \
+    --ws-url ws://127.0.0.1:8545 \
+    --rpc-url http://127.0.0.1:9090/queries/sepolia \
+    --reconnect-delay 5 \
+    --catchup-batch-size 100
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

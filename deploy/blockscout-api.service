@@ -1,0 +1,17 @@
+[Unit]
+Description=Blockscout API Server
+After=network.target foundationdb.service
+
+[Service]
+Type=simple
+User=root
+Environment=RUST_LOG=info
+ExecStart=/mnt/sepolia/blockscout-exex/bin/blockscout-api \
+    --rpc-url http://127.0.0.1:9090/queries/sepolia \
+    --meili-url http://127.0.0.1:7700 \
+    --port 4000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

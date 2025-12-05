@@ -1,6 +1,7 @@
 //! Live block subscription - keeps index updated with new blocks
 //!
 //! Subscribes to new blocks via WebSocket and indexes them in real-time.
+//! Also catches up on any missed blocks between last_indexed and chain head.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use blockscout_exex::fdb_index::{FdbIndex, TokenTransfer};
-use blockscout_exex::transform::decode_erc20_transfer;
+use blockscout_exex::transform::{decode_token_transfer, TokenType};
 
 #[derive(Parser)]
 #[command(name = "blockscout-subscriber")]
@@ -35,6 +36,10 @@ struct Args {
     /// Reconnect delay on disconnect (seconds)
     #[arg(long, default_value = "5")]
     reconnect_delay: u64,
+
+    /// Maximum blocks to catch up per batch
+    #[arg(long, default_value = "100")]
+    catchup_batch_size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,8 +136,19 @@ impl RpcClient {
         Ok(serde_json::from_value(result.clone())?)
     }
 
+    async fn get_block_number(&self) -> Result<u64> {
+        let hex: String = self.call("eth_blockNumber", serde_json::json!([])).await?;
+        Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
+    }
+
     async fn get_block(&self, hash: &str) -> Result<Option<RpcBlock>> {
         self.call("eth_getBlockByHash", serde_json::json!([hash, true]))
+            .await
+    }
+
+    async fn get_block_by_number(&self, number: u64) -> Result<Option<RpcBlock>> {
+        let hex = format!("0x{:x}", number);
+        self.call("eth_getBlockByNumber", serde_json::json!([hex, true]))
             .await
     }
 
@@ -165,11 +181,17 @@ fn parse_tx_index(tx: &RpcTransaction) -> u32 {
 async fn index_block(
     index: &FdbIndex,
     rpc: &RpcClient,
-    block_hash: &str,
     block_number: u64,
+    block_hash: Option<&str>,
 ) -> Result<()> {
-    let Some(block) = rpc.get_block(block_hash).await? else {
-        warn!("Block {} not found", block_hash);
+    let block = if let Some(hash) = block_hash {
+        rpc.get_block(hash).await?
+    } else {
+        rpc.get_block_by_number(block_number).await?
+    };
+
+    let Some(block) = block else {
+        warn!("Block {} not found", block_number);
         return Ok(());
     };
 
@@ -201,17 +223,42 @@ async fn index_block(
         if let Some(receipt) = receipt_map.get(&tx.hash) {
             for (log_index, rpc_log) in receipt.logs.iter().enumerate() {
                 if let Some(log) = parse_log(rpc_log) {
-                    if let Some((token, from, to, value)) = decode_erc20_transfer(&log) {
-                        let transfer = TokenTransfer::new(
-                            tx_hash,
-                            log_index as u64,
-                            token,
-                            from,
-                            to,
-                            value,
-                            block_number,
-                            timestamp,
-                        );
+                    // Use unified decoder for ERC-20, ERC-721, ERC-1155
+                    let decoded_transfers = decode_token_transfer(&log);
+                    for decoded in decoded_transfers {
+                        let transfer = match decoded.token_type {
+                            TokenType::Erc721 => TokenTransfer::new_erc721(
+                                tx_hash,
+                                log_index as u64,
+                                decoded.token_address,
+                                decoded.from,
+                                decoded.to,
+                                decoded.token_id.unwrap(),
+                                block_number,
+                                timestamp,
+                            ),
+                            TokenType::Erc1155 => TokenTransfer::new_erc1155(
+                                tx_hash,
+                                log_index as u64,
+                                decoded.token_address,
+                                decoded.from,
+                                decoded.to,
+                                decoded.token_id.unwrap(),
+                                decoded.value,
+                                block_number,
+                                timestamp,
+                            ),
+                            TokenType::Erc20 => TokenTransfer::new(
+                                tx_hash,
+                                log_index as u64,
+                                decoded.token_address,
+                                decoded.from,
+                                decoded.to,
+                                decoded.value,
+                                block_number,
+                                timestamp,
+                            ),
+                        };
                         batch.insert_transfer(transfer);
                     }
                 }
@@ -220,13 +267,69 @@ async fn index_block(
     }
 
     batch.commit(block_number).await?;
-    info!(block = block_number, "Indexed block");
-
     Ok(())
+}
+
+/// Catch up on any missed blocks between last_indexed and chain head
+async fn catchup_missed_blocks(
+    index: &FdbIndex,
+    rpc: &RpcClient,
+    batch_size: u64,
+) -> Result<u64> {
+    let last_indexed = index.last_indexed_block().await?.unwrap_or(0);
+    let chain_head = rpc.get_block_number().await?;
+
+    if last_indexed >= chain_head {
+        info!(
+            last_indexed = last_indexed,
+            chain_head = chain_head,
+            "Index is up to date"
+        );
+        return Ok(last_indexed);
+    }
+
+    let gap = chain_head - last_indexed;
+    info!(
+        last_indexed = last_indexed,
+        chain_head = chain_head,
+        gap = gap,
+        "Catching up on missed blocks"
+    );
+
+    let mut current = last_indexed + 1;
+    while current <= chain_head {
+        let batch_end = (current + batch_size - 1).min(chain_head);
+
+        for block_num in current..=batch_end {
+            if let Err(e) = index_block(index, rpc, block_num, None).await {
+                error!("Failed to index block {}: {}", block_num, e);
+                // Continue with next block, don't fail the whole catchup
+            }
+        }
+
+        info!(
+            from = current,
+            to = batch_end,
+            remaining = chain_head - batch_end,
+            "Caught up batch"
+        );
+
+        current = batch_end + 1;
+    }
+
+    info!(
+        blocks_indexed = chain_head - last_indexed,
+        "Catchup complete"
+    );
+    Ok(chain_head)
 }
 
 async fn subscribe_loop(args: &Args, index: &FdbIndex) -> Result<()> {
     let rpc = RpcClient::new(&args.rpc_url);
+
+    // First, catch up on any missed blocks
+    let last_block = catchup_missed_blocks(index, &rpc, args.catchup_batch_size).await?;
+    info!(last_block = last_block, "Starting live subscription");
 
     info!("Connecting to {}", args.ws_url);
 
@@ -248,6 +351,8 @@ async fn subscribe_loop(args: &Args, index: &FdbIndex) -> Result<()> {
 
     info!("Subscribed to newHeads");
 
+    let mut expected_block = last_block + 1;
+
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
@@ -268,11 +373,32 @@ async fn subscribe_loop(args: &Args, index: &FdbIndex) -> Result<()> {
                             16,
                         )?;
 
+                        // Check for gaps - if we missed blocks, catch up
+                        if block_number > expected_block {
+                            warn!(
+                                expected = expected_block,
+                                received = block_number,
+                                gap = block_number - expected_block,
+                                "Gap detected, catching up"
+                            );
+                            for missed in expected_block..block_number {
+                                if let Err(e) = index_block(index, &rpc, missed, None).await {
+                                    error!("Failed to index missed block {}: {}", missed, e);
+                                } else {
+                                    info!(block = missed, "Indexed missed block");
+                                }
+                            }
+                        }
+
                         if let Err(e) =
-                            index_block(index, &rpc, &params.result.hash, block_number).await
+                            index_block(index, &rpc, block_number, Some(&params.result.hash)).await
                         {
                             error!("Failed to index block {}: {}", block_number, e);
+                        } else {
+                            info!(block = block_number, "Indexed block");
                         }
+
+                        expected_block = block_number + 1;
                     }
                 }
             }
