@@ -172,6 +172,7 @@ async fn main() -> Result<()> {
         rpc_url: args.reth_rpc.clone(),
         search,
         rpc_executor,
+        chain: args.chain.clone(),
         gas_price_cache: Arc::new(parking_lot::RwLock::new(None)),
         coin_price_cache: Arc::new(parking_lot::RwLock::new(None)),
     });

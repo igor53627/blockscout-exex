@@ -121,6 +121,10 @@ async fn main() -> Result<()> {
                 broadcaster: websocket::create_broadcaster(),
                 rpc_url: None,
                 search: None,
+                rpc_executor: None,
+                chain: chain.clone(),
+                gas_price_cache: std::sync::Arc::new(parking_lot::RwLock::new(None)),
+                coin_price_cache: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             });
             let router = api::create_router(state);
 

@@ -51,6 +51,8 @@ pub struct ApiState {
     pub rpc_url: Option<String>,
     pub search: Option<SearchClient>,
     pub rpc_executor: Option<Arc<RpcExecutor>>,
+    /// Chain name for oracle selection (e.g., "sepolia", "mainnet")
+    pub chain: String,
     // Price caches (TTL: 30 seconds)
     pub gas_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
     pub coin_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
@@ -2056,9 +2058,8 @@ async fn get_coin_price(state: &ApiState) -> Option<String> {
         }
     }
 
-    // Determine oracle address based on chain (simple heuristic)
-    // You may want to make this configurable via CLI args
-    let oracle_address = if rpc_url.contains("sepolia") {
+    // Determine oracle address based on chain
+    let oracle_address = if state.chain.to_lowercase().contains("sepolia") {
         "0x694AA1769357215DE4FAC081bf1f309aDC325306" // Sepolia
     } else {
         "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419" // Mainnet
