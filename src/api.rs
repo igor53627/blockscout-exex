@@ -2003,11 +2003,10 @@ async fn fetch_chainlink_price_rpc(rpc_url: &str, oracle_address: &str) -> Resul
     Ok(format!("{:.2}", price_usd))
 }
 
-/// Convert wei string to Gwei float (rounded to 2 decimals)
+/// Convert wei string to Gwei float
 fn wei_to_gwei(wei_str: &str) -> f64 {
     let wei: u128 = wei_str.parse().unwrap_or(0);
-    let gwei = wei as f64 / 1_000_000_000.0;
-    (gwei * 100.0).round() / 100.0
+    wei as f64 / 1_000_000_000.0
 }
 
 /// Get cached gas price or fetch from RPC
