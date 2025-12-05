@@ -29,6 +29,22 @@ use alloy_primitives::Address;
 // Re-export TokenTransfer from index_trait for compatibility
 pub use crate::index_trait::TokenTransfer;
 
+use hyperloglogplus::HyperLogLogPlus;
+use std::collections::hash_map::RandomState;
+
+/// Type alias for HyperLogLog used for address counting
+pub type AddressHll = HyperLogLogPlus<AddressWrapper, RandomState>;
+
+/// Wrapper for Address to implement Hash trait for HyperLogLog
+#[derive(Clone, Copy)]
+pub struct AddressWrapper(pub Address);
+
+impl Hash for AddressWrapper {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_slice().hash(state);
+    }
+}
+
 const SCHEMA_VERSION: u32 = 1;
 const META_SCHEMA_VERSION: &[u8] = b"schema_version";
 
@@ -663,6 +679,43 @@ impl MdbxIndex {
     pub fn get_daily_metric(&self, _year: u16, _month: u8, _day: u8, _metric: u8) -> Result<i64> {
         Err(eyre::eyre!("MDBX support requires 'reth' feature"))
     }
+
+    // ============================================================================
+    // HyperLogLog Support (for address counting)
+    // ============================================================================
+
+    /// Create a new empty HyperLogLog for address counting
+    /// Uses same precision as FDB (14 bits = ~16K registers)
+    pub fn new_address_hll() -> AddressHll {
+        use hyperloglogplus::HyperLogLogPlus;
+        use std::collections::hash_map::RandomState;
+        const HLL_PRECISION: u8 = 14;
+        HyperLogLogPlus::new(HLL_PRECISION, RandomState::new()).unwrap()
+    }
+
+    /// Load the address HLL count from MDBX (we store just the count, not full HLL)
+    #[cfg(feature = "reth")]
+    pub fn load_address_hll_count(&self) -> Result<u64> {
+        // For now, return 0 - will be stored in metadata table
+        Ok(0)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn load_address_hll_count(&self) -> Result<u64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Save the address HLL count to MDBX
+    #[cfg(feature = "reth")]
+    pub fn save_address_hll_count(&self, _count: u64) -> Result<()> {
+        // For now, no-op - will store in metadata table
+        Ok(())
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn save_address_hll_count(&self, _count: u64) -> Result<()> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
 }
 
 // Transaction wrapper types
@@ -798,6 +851,39 @@ impl MdbxWriteBatch {
         self.daily_metrics.push((key, value));
     }
 
+    /// Record metrics for a block timestamp (extracts date and increments daily counters)
+    pub fn record_block_timestamp(&mut self, timestamp: u64, tx_count: i64, transfer_count: i64) {
+        let dt = chrono::DateTime::from_timestamp(timestamp as i64, 0)
+            .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+        let year = dt.format("%Y").to_string().parse::<u16>().unwrap_or(2024);
+        let month = dt.format("%m").to_string().parse::<u8>().unwrap_or(1);
+        let day = dt.format("%d").to_string().parse::<u8>().unwrap_or(1);
+        // Metric type 0 = TX count, 1 = transfer count
+        self.record_daily_metric(year, month, day, 0, tx_count);
+        self.record_daily_metric(year, month, day, 1, transfer_count);
+    }
+
+    /// Collect all unique addresses from this batch for HLL insertion
+    pub fn collect_addresses(&self) -> impl Iterator<Item = Address> + '_ {
+        // Addresses from transactions
+        let tx_addrs = self.address_txs.iter().map(|(key, _)| key.address());
+
+        // Addresses from transfers (from + to)
+        let transfer_addrs = self.transfers.iter().flat_map(|t| {
+            [Address::from(t.from), Address::from(t.to)]
+        });
+
+        tx_addrs.chain(transfer_addrs)
+    }
+
+    /// Check if batch is getting large (for memory efficiency, not hard limit like FDB)
+    pub fn is_large(&self) -> bool {
+        // MDBX doesn't have FDB's 10MB transaction limit, but we still want to
+        // commit periodically for memory efficiency and progress tracking
+        let total_entries = self.address_txs.len() + self.tx_blocks.len() + self.transfers.len();
+        total_entries > 50_000 // More generous than FDB since no hard limit
+    }
+
     /// Commit the batch atomically
     pub fn commit(self, _last_block: u64) -> Result<()> {
         let tx = self.env.tx_mut()?;
@@ -844,6 +930,17 @@ impl MdbxWriteBatch {
     }
 
     pub fn record_daily_metric(&mut self, _year: u16, _month: u8, _day: u8, _metric: u8, _value: i64) {
+    }
+
+    pub fn record_block_timestamp(&mut self, _timestamp: u64, _tx_count: i64, _transfer_count: i64) {
+    }
+
+    pub fn collect_addresses(&self) -> impl Iterator<Item = Address> + '_ {
+        std::iter::empty()
+    }
+
+    pub fn is_large(&self) -> bool {
+        false
     }
 
     pub fn commit(self, _last_block: u64) -> Result<()> {

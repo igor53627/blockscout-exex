@@ -25,6 +25,93 @@ pub struct TokenTransfer {
     pub token_id: Option<[u8; 32]>,  // For ERC-721/ERC-1155
 }
 
+impl TokenTransfer {
+    /// Create a new ERC-20 token transfer
+    pub fn new(
+        tx_hash: TxHash,
+        log_index: u64,
+        token_address: Address,
+        from: Address,
+        to: Address,
+        value: U256,
+        block_number: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            tx_hash: tx_hash.0,
+            log_index,
+            token_address: token_address.0 .0,
+            from: from.0 .0,
+            to: to.0 .0,
+            value: value.to_be_bytes(),
+            block_number,
+            timestamp,
+            token_type: 0, // ERC-20
+            token_id: None,
+        }
+    }
+
+    /// Create a new ERC-721 token transfer
+    pub fn new_erc721(
+        tx_hash: TxHash,
+        log_index: u64,
+        token_address: Address,
+        from: Address,
+        to: Address,
+        token_id: U256,
+        block_number: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            tx_hash: tx_hash.0,
+            log_index,
+            token_address: token_address.0 .0,
+            from: from.0 .0,
+            to: to.0 .0,
+            value: U256::from(1).to_be_bytes(), // ERC-721 transfers exactly 1 token
+            block_number,
+            timestamp,
+            token_type: 1, // ERC-721
+            token_id: Some(token_id.to_be_bytes()),
+        }
+    }
+
+    /// Create a new ERC-1155 token transfer
+    pub fn new_erc1155(
+        tx_hash: TxHash,
+        log_index: u64,
+        token_address: Address,
+        from: Address,
+        to: Address,
+        token_id: U256,
+        value: U256,
+        block_number: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            tx_hash: tx_hash.0,
+            log_index,
+            token_address: token_address.0 .0,
+            from: from.0 .0,
+            to: to.0 .0,
+            value: value.to_be_bytes(),
+            block_number,
+            timestamp,
+            token_type: 2, // ERC-1155
+            token_id: Some(token_id.to_be_bytes()),
+        }
+    }
+
+    /// Get token type as string
+    pub fn token_type_str(&self) -> &'static str {
+        match self.token_type {
+            1 => "ERC-721",
+            2 => "ERC-1155",
+            _ => "ERC-20",
+        }
+    }
+}
+
 /// Unified database trait for index operations
 ///
 /// Both FdbIndex and MdbxIndex implement this trait, allowing the API

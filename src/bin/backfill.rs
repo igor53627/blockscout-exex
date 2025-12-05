@@ -84,8 +84,9 @@ struct Args {
     meili_key: Option<String>,
 }
 
-// ============ JSON-RPC Types and Client ============
+// ============ JSON-RPC Types and Client (FDB only) ============
 
+#[cfg(feature = "fdb")]
 #[derive(Debug, Deserialize)]
 struct RpcBlock {
     #[allow(dead_code)]
@@ -94,6 +95,7 @@ struct RpcBlock {
     transactions: Vec<RpcTransaction>,
 }
 
+#[cfg(feature = "fdb")]
 #[derive(Debug, Deserialize)]
 struct RpcTransaction {
     hash: String,
@@ -103,6 +105,7 @@ struct RpcTransaction {
     transaction_index: Option<String>,
 }
 
+#[cfg(feature = "fdb")]
 #[derive(Debug, Deserialize)]
 struct RpcReceipt {
     #[serde(rename = "transactionHash")]
@@ -110,6 +113,7 @@ struct RpcReceipt {
     logs: Vec<RpcLog>,
 }
 
+#[cfg(feature = "fdb")]
 #[derive(Debug, Deserialize)]
 struct RpcLog {
     address: String,
@@ -117,15 +121,18 @@ struct RpcLog {
     data: String,
 }
 
+#[cfg(feature = "fdb")]
 enum RpcTransport {
     Http { url: String, client: reqwest::Client },
     Ipc { path: PathBuf },
 }
 
+#[cfg(feature = "fdb")]
 struct RpcClient {
     transport: RpcTransport,
 }
 
+#[cfg(feature = "fdb")]
 impl RpcClient {
     fn new_http(url: &str) -> Self {
         Self {
@@ -228,6 +235,7 @@ impl RpcClient {
     }
 }
 
+#[cfg(feature = "fdb")]
 fn parse_log(rpc_log: &RpcLog) -> Option<Log> {
     let address: Address = rpc_log.address.parse().ok()?;
     let topics: Vec<_> = rpc_log
@@ -240,6 +248,7 @@ fn parse_log(rpc_log: &RpcLog) -> Option<Log> {
     Some(Log::new(address, topics, data.into()).unwrap())
 }
 
+#[cfg(feature = "fdb")]
 fn parse_tx_index(tx: &RpcTransaction) -> u32 {
     tx.transaction_index
         .as_ref()
@@ -247,9 +256,187 @@ fn parse_tx_index(tx: &RpcTransaction) -> u32 {
         .unwrap_or(0)
 }
 
-// ============ Direct MDBX Mode ============
+// ============ Direct MDBX Mode (MDBX target) ============
 
-#[cfg(feature = "reth")]
+#[cfg(all(feature = "reth", feature = "mdbx"))]
+mod direct_mdbx {
+    use super::*;
+    use alloy_primitives::Log;
+    use blockscout_exex::meili::SearchClient;
+    use blockscout_exex::mdbx_index::{MdbxIndex, AddressWrapper, TokenTransfer as MdbxTokenTransfer};
+    use blockscout_exex::reth_reader::RethReader;
+    use hyperloglogplus::HyperLogLog;
+
+    pub struct DirectMdbxBackfillConfig<'a> {
+        pub reader: &'a RethReader,
+        pub index: &'a MdbxIndex,
+        pub search: Option<&'a SearchClient>,
+        pub chain: &'a str,
+        pub from_block: u64,
+        pub to_block: u64,
+        pub batch_size: u64,
+    }
+
+    pub fn run_direct_mdbx_backfill(config: DirectMdbxBackfillConfig<'_>) -> Result<()> {
+        let DirectMdbxBackfillConfig {
+            reader,
+            index,
+            search: _search, // TODO: wire up Meilisearch
+            chain: _chain,
+            from_block,
+            to_block,
+            batch_size,
+        } = config;
+
+        let total = to_block - from_block + 1;
+        let mut processed = 0u64;
+        let mut seen_tokens: HashSet<Address> = HashSet::new();
+
+        // Create in-memory HLL for address counting
+        let mut address_hll = MdbxIndex::new_address_hll();
+        let prev_count = index.load_address_hll_count().unwrap_or(0);
+        info!("Starting address HLL (previous count: ~{})", prev_count);
+        let mut hll_save_counter = 0u64;
+        const HLL_SAVE_INTERVAL: u64 = 10000;
+
+        for batch_start in (from_block..=to_block).step_by(batch_size as usize) {
+            let batch_end = (batch_start + batch_size - 1).min(to_block);
+
+            let mut batch = index.write_batch();
+
+            for block_num in batch_start..=batch_end {
+                let Some(block) = reader.block_by_number(block_num)? else {
+                    continue;
+                };
+
+                let receipts = reader.receipts_by_block(block_num)?.unwrap_or_default();
+                let timestamp = block.header().timestamp;
+
+                let mut block_tx_count = 0i64;
+                let mut block_transfer_count = 0i64;
+
+                for (tx_idx, tx) in block.transactions_with_sender().enumerate() {
+                    let (from, tx) = tx;
+                    let tx_hash = *tx.tx_hash();
+
+                    // Index by sender
+                    batch.insert_address_tx(*from, tx_hash, block_num, tx_idx as u32);
+
+                    // Index by receiver
+                    use alloy_consensus::transaction::Transaction as TxTrait;
+                    if let Some(to) = TxTrait::to(tx) {
+                        batch.insert_address_tx(to, tx_hash, block_num, tx_idx as u32);
+                    }
+
+                    // Index tx → block
+                    batch.insert_tx_block(tx_hash, block_num);
+                    block_tx_count += 1;
+
+                    // Process logs for token transfers
+                    if let Some(receipt) = receipts.get(tx_idx) {
+                        for (log_index, log) in receipt.logs.iter().enumerate() {
+                            let alloy_log = Log::new(log.address, log.topics().to_vec(), log.data.data.clone()).unwrap();
+                            let decoded_transfers = decode_token_transfer(&alloy_log);
+                            for decoded in decoded_transfers {
+                                let transfer = match decoded.token_type {
+                                    TokenType::Erc721 => MdbxTokenTransfer::new_erc721(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.token_id.unwrap(),
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                    TokenType::Erc1155 => MdbxTokenTransfer::new_erc1155(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.token_id.unwrap(),
+                                        decoded.value,
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                    TokenType::Erc20 => MdbxTokenTransfer::new(
+                                        tx_hash,
+                                        log_index as u64,
+                                        decoded.token_address,
+                                        decoded.from,
+                                        decoded.to,
+                                        decoded.value,
+                                        block_num,
+                                        timestamp,
+                                    ),
+                                };
+                                batch.insert_transfer(transfer);
+                                block_transfer_count += 1;
+
+                                if !seen_tokens.contains(&decoded.token_address) {
+                                    seen_tokens.insert(decoded.token_address);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Record daily metrics
+                batch.record_block_timestamp(timestamp, block_tx_count, block_transfer_count);
+
+                processed += 1;
+
+                // Commit when batch is getting large
+                if batch.is_large() {
+                    for addr in batch.collect_addresses() {
+                        address_hll.insert(&AddressWrapper(addr));
+                    }
+                    batch.commit(block_num)?;
+                    batch = index.write_batch();
+                }
+
+                if processed % 1000 == 0 {
+                    let percent = (processed as f64 / total as f64) * 100.0;
+                    info!(
+                        block = block_num,
+                        progress = format!("{:.2}%", percent),
+                        "Progress"
+                    );
+                }
+            }
+
+            // Update HLL before commit
+            for addr in batch.collect_addresses() {
+                address_hll.insert(&AddressWrapper(addr));
+            }
+
+            // Commit remaining batch
+            batch.commit(batch_end)?;
+            debug!(from = batch_start, to = batch_end, "Batch complete");
+
+            // Save HLL count periodically
+            hll_save_counter += batch_size;
+            if hll_save_counter >= HLL_SAVE_INTERVAL {
+                let count = address_hll.count() as u64;
+                index.save_address_hll_count(count)?;
+                info!("Saved address HLL count (~{} unique addresses)", count);
+                hll_save_counter = 0;
+            }
+        }
+
+        // Final HLL count save
+        let final_count = address_hll.count() as u64;
+        index.save_address_hll_count(final_count)?;
+        info!("Final address count: ~{} unique addresses", final_count);
+
+        Ok(())
+    }
+}
+
+// ============ Direct MDBX Mode (FDB target) ============
+
+#[cfg(all(feature = "reth", feature = "fdb"))]
 mod direct {
     use super::*;
     use alloy_primitives::Log;
@@ -465,8 +652,9 @@ mod direct {
     }
 }
 
-// ============ JSON-RPC Mode ============
+// ============ JSON-RPC Mode (FDB target) ============
 
+#[cfg(feature = "fdb")]
 async fn run_rpc_backfill(
     rpc: &RpcClient,
     index: &FdbIndex,
@@ -648,6 +836,7 @@ async fn run_rpc_backfill(
     Ok(())
 }
 
+#[cfg(feature = "fdb")]
 async fn fetch_token_docs(rpc: &RpcClient, chain: &str, tokens: &[(Address, TokenType)]) -> Vec<TokenDocument> {
     let mut docs = Vec::new();
     
@@ -687,6 +876,7 @@ async fn fetch_token_docs(rpc: &RpcClient, chain: &str, tokens: &[(Address, Toke
     docs
 }
 
+#[cfg(feature = "fdb")]
 async fn fetch_token_metadata_rpc(
     rpc: &RpcClient,
     token_addr: &str,
@@ -718,6 +908,7 @@ async fn fetch_token_metadata_rpc(
     (name, symbol, decimals)
 }
 
+#[cfg(feature = "fdb")]
 fn decode_string_result(hex: &str) -> Option<String> {
     let bytes = hex::decode(hex.trim_start_matches("0x")).ok()?;
     if bytes.len() < 64 {
@@ -740,14 +931,71 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Backend selection note:
-    // The backfill tool currently uses FdbIndex concrete type throughout the codebase.
-    // Full trait-based abstraction would require refactoring run_rpc_backfill and direct module.
-    // For now, we support MDBX via separate code paths (TODO: refactor to use IndexDatabase trait)
+    // Backend selection: MDBX or FDB
+    // When --mdbx-path is provided with --reth-db, use direct MDBX backfill
+    // Otherwise fall through to FDB backend
+
+    #[cfg(all(feature = "mdbx", feature = "reth"))]
+    if let (Some(mdbx_path), Some(reth_db)) = (&args.mdbx_path, &args.reth_db) {
+        let static_files = args
+            .reth_static_files
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| reth_db.join("static_files"));
+
+        info!("Opening reth database at {:?}", reth_db);
+        info!("Static files at {:?}", static_files);
+        info!("Target MDBX index at {:?}", mdbx_path);
+
+        let chain = &args.chain;
+        let reader = if chain == "sepolia" {
+            blockscout_exex::reth_reader::RethReader::open_sepolia(reth_db, &static_files)?
+        } else {
+            blockscout_exex::reth_reader::RethReader::open_mainnet(reth_db, &static_files)?
+        };
+
+        let index = MdbxIndex::open(mdbx_path)?;
+
+        let from_block = if args.from_block == 0 {
+            index.get_last_indexed_block()?.map(|b| b + 1).unwrap_or(0)
+        } else {
+            args.from_block
+        };
+
+        let to_block = if args.to_block == 0 {
+            reader.last_block_number()?.unwrap_or(0)
+        } else {
+            args.to_block
+        };
+
+        // Initialize Meilisearch client if configured
+        let search = if let Some(ref meili_url) = args.meili_url {
+            info!("Connecting to Meilisearch at {}", meili_url);
+            let client = SearchClient::new(meili_url, args.meili_key.as_deref(), chain);
+            Some(client)
+        } else {
+            None
+        };
+
+        info!(from = from_block, to = to_block, mode = "direct MDBX", "Starting backfill");
+
+        direct_mdbx::run_direct_mdbx_backfill(direct_mdbx::DirectMdbxBackfillConfig {
+            reader: &reader,
+            index: &index,
+            search: search.as_ref(),
+            chain,
+            from_block,
+            to_block,
+            batch_size: args.batch_size,
+        })?;
+
+        info!("MDBX backfill complete");
+        return Ok(());
+    }
 
     #[cfg(feature = "mdbx")]
     if args.mdbx_path.is_some() {
-        eyre::bail!("MDBX backend for backfill not yet fully implemented. Use FDB for now. See Task 9 for migration tool.");
+        eyre::bail!("MDBX backfill requires --reth-db (direct Reth database access). RPC mode not yet supported for MDBX.");
     }
 
     // Initialize FDB network
@@ -773,8 +1021,8 @@ async fn main() -> Result<()> {
         eyre::bail!("Backfill requires FDB feature. Build with --features fdb");
     }
 
-    // Check if using direct MDBX mode
-    #[cfg(feature = "reth")]
+    // Check if using direct Reth mode (with FDB as target)
+    #[cfg(all(feature = "reth", feature = "fdb"))]
     if let Some(reth_db) = &args.reth_db {
         let static_files = args
             .reth_static_files
@@ -816,7 +1064,7 @@ async fn main() -> Result<()> {
             None
         };
 
-        info!(from = from_block, to = to_block, mode = "direct MDBX", "Starting backfill");
+        info!(from = from_block, to = to_block, mode = "direct Reth -> FDB", "Starting backfill");
 
         direct::run_direct_backfill(direct::DirectBackfillConfig {
             reader: &reader,
@@ -832,52 +1080,57 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize Meilisearch client if configured
-    let search = if let Some(ref meili_url) = args.meili_url {
-        info!("Connecting to Meilisearch at {}", meili_url);
-        let client = SearchClient::new(meili_url, args.meili_key.as_deref(), "sepolia");
-        if let Err(e) = client.ensure_indexes().await {
-            warn!("Failed to configure Meilisearch indexes: {}", e);
-        }
-        Some(client)
-    } else {
-        None
-    };
+    // FDB-only: RPC backfill mode
+    #[cfg(feature = "fdb")]
+    {
+        // Initialize Meilisearch client if configured
+        let search = if let Some(ref meili_url) = args.meili_url {
+            info!("Connecting to Meilisearch at {}", meili_url);
+            let client = SearchClient::new(meili_url, args.meili_key.as_deref(), "sepolia");
+            if let Err(e) = client.ensure_indexes().await {
+                warn!("Failed to configure Meilisearch indexes: {}", e);
+            }
+            Some(client)
+        } else {
+            None
+        };
 
-    // IPC or HTTP JSON-RPC mode
-    let rpc = if let Some(ipc_path) = &args.ipc_path {
-        info!(mode = "IPC", path = %ipc_path.display(), "Starting backfill");
-        RpcClient::new_ipc(ipc_path.clone())
-    } else {
-        info!(mode = "HTTP", url = %args.rpc_url, "Starting backfill");
-        RpcClient::new_http(&args.rpc_url)
-    };
+        // IPC or HTTP JSON-RPC mode
+        let rpc = if let Some(ipc_path) = &args.ipc_path {
+            info!(mode = "IPC", path = %ipc_path.display(), "Starting backfill");
+            RpcClient::new_ipc(ipc_path.clone())
+        } else {
+            info!(mode = "HTTP", url = %args.rpc_url, "Starting backfill");
+            RpcClient::new_http(&args.rpc_url)
+        };
 
-    let from_block = if args.from_block == 0 {
-        index.last_indexed_block().await?.map(|b| b + 1).unwrap_or(0)
-    } else {
-        args.from_block
-    };
+        let from_block = if args.from_block == 0 {
+            index.last_indexed_block().await?.map(|b| b + 1).unwrap_or(0)
+        } else {
+            args.from_block
+        };
 
-    let to_block = if args.to_block == 0 {
-        rpc.get_block_number().await?
-    } else {
-        args.to_block
-    };
+        let to_block = if args.to_block == 0 {
+            rpc.get_block_number().await?
+        } else {
+            args.to_block
+        };
 
-    info!(from = from_block, to = to_block, "Block range");
+        info!(from = from_block, to = to_block, "Block range");
 
-    run_rpc_backfill(
-        &rpc,
-        &index,
-        search.as_ref(),
-        "sepolia",
-        from_block,
-        to_block,
-        args.batch_size,
-    )
-    .await?;
+        run_rpc_backfill(
+            &rpc,
+            &index,
+            search.as_ref(),
+            "sepolia",
+            from_block,
+            to_block,
+            args.batch_size,
+        )
+        .await?;
 
-    info!("Backfill complete");
+        info!("Backfill complete");
+    }
+
     Ok(())
 }
