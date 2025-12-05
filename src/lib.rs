@@ -10,7 +10,7 @@ pub mod cache;
 pub mod fdb_index;
 pub mod index_trait;
 pub mod meili;
-#[cfg(feature = "reth")]
+#[cfg(feature = "mdbx")]
 pub mod mdbx_index;
 #[cfg(feature = "reth")]
 pub mod reth_reader;
@@ -23,5 +23,7 @@ pub use cache::{CacheEntry, CacheStats, LruCache, new_json_cache, new_bytes_cach
 #[cfg(feature = "fdb")]
 pub use fdb_index::{FdbIndex, WriteBatch};
 pub use index_trait::{IndexDatabase, TokenTransfer};
+#[cfg(feature = "mdbx")]
+pub use mdbx_index::MdbxIndex;
 pub use rpc_executor::{RpcExecutor, RpcRequest, RpcResponse};
 pub use transform::{decode_token_transfer, DecodedTransfer, TokenType};
