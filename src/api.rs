@@ -2009,6 +2009,22 @@ fn wei_to_gwei(wei_str: &str) -> f64 {
     wei as f64 / 1_000_000_000.0
 }
 
+/// Create GasPriceInfo JSON object in Blockscout format
+fn gas_price_info_json(gwei: f64) -> Value {
+    let info = json!({
+        "price": gwei,
+        "fiat_price": null,
+        "time": null,
+        "base_fee": null,
+        "priority_fee": null
+    });
+    json!({
+        "average": info.clone(),
+        "fast": info.clone(),
+        "slow": info
+    })
+}
+
 /// Get cached gas price or fetch from RPC
 async fn get_gas_price(state: &ApiState) -> Option<Value> {
     let rpc_url = state.rpc_url.as_ref()?;
@@ -2020,11 +2036,7 @@ async fn get_gas_price(state: &ApiState) -> Option<Value> {
         if let Some(cached) = cache.as_ref() {
             if !cached.is_expired(cache_ttl) {
                 let gwei = wei_to_gwei(&cached.value);
-                return Some(json!({
-                    "average": gwei,
-                    "fast": gwei,
-                    "slow": gwei
-                }));
+                return Some(gas_price_info_json(gwei));
             }
         }
     }
@@ -2039,11 +2051,7 @@ async fn get_gas_price(state: &ApiState) -> Option<Value> {
             }
             // Return as Gwei
             let gwei = wei_to_gwei(&gas_price_wei);
-            Some(json!({
-                "average": gwei,
-                "fast": gwei,
-                "slow": gwei
-            }))
+            Some(gas_price_info_json(gwei))
         }
         Err(e) => {
             tracing::warn!("Failed to fetch gas price: {}", e);
