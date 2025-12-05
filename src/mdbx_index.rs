@@ -19,6 +19,23 @@
 use reth_db::mdbx::{DatabaseEnv, DatabaseEnvKind, DatabaseArguments};
 #[cfg(feature = "reth")]
 use reth_db_api::{database::Database, models::ClientVersion, transaction::DbTx};
+#[cfg(feature = "reth")]
+use reth_libmdbx::{WriteFlags, DatabaseFlags};
+
+// Table name constants for our custom index schema
+#[cfg(feature = "reth")]
+mod tables {
+    pub const ADDRESS_TXS: &str = "AddressTxs";
+    pub const TX_BLOCKS: &str = "TxBlocks";
+    pub const ADDRESS_TRANSFERS: &str = "AddressTransfers";
+    pub const TOKEN_TRANSFERS: &str = "TokenTransfers";
+    pub const TOKEN_HOLDERS: &str = "TokenHolders";
+    pub const COUNTERS: &str = "Counters";
+    pub const ADDRESS_COUNTERS: &str = "AddressCounters";
+    pub const TOKEN_HOLDER_COUNTS: &str = "TokenHolderCounts";
+    pub const DAILY_METRICS: &str = "DailyMetrics";
+    pub const METADATA: &str = "Metadata";
+}
 
 use std::path::Path;
 use std::sync::Arc;
@@ -885,12 +902,106 @@ impl MdbxWriteBatch {
     }
 
     /// Commit the batch atomically
-    pub fn commit(self, _last_block: u64) -> Result<()> {
+    pub fn commit(self, last_block: u64) -> Result<()> {
+        use reth_db_api::transaction::DbTxMut;
+
+        // Get raw mutable transaction
         let tx = self.env.tx_mut()?;
 
-        // Write all data to tables
-        // For now, we're just committing an empty transaction
-        // In production, we'd write to proper MDBX tables using reth's table API
+        // Open or create all our tables, getting the DBI handles
+        let addr_txs_dbi = tx.inner.create_db(Some(tables::ADDRESS_TXS), DatabaseFlags::default())?.dbi();
+        let tx_blocks_dbi = tx.inner.create_db(Some(tables::TX_BLOCKS), DatabaseFlags::default())?.dbi();
+        let addr_transfers_dbi = tx.inner.create_db(Some(tables::ADDRESS_TRANSFERS), DatabaseFlags::default())?.dbi();
+        let token_transfers_dbi = tx.inner.create_db(Some(tables::TOKEN_TRANSFERS), DatabaseFlags::default())?.dbi();
+        let counters_dbi = tx.inner.create_db(Some(tables::COUNTERS), DatabaseFlags::default())?.dbi();
+        let addr_counters_dbi = tx.inner.create_db(Some(tables::ADDRESS_COUNTERS), DatabaseFlags::default())?.dbi();
+        let daily_metrics_dbi = tx.inner.create_db(Some(tables::DAILY_METRICS), DatabaseFlags::default())?.dbi();
+        let metadata_dbi = tx.inner.create_db(Some(tables::METADATA), DatabaseFlags::default())?.dbi();
+
+        // Write address -> tx mappings
+        for (key, tx_hash) in &self.address_txs {
+            tx.inner.put(addr_txs_dbi, key.encode(), tx_hash.as_slice(), WriteFlags::UPSERT)?;
+        }
+
+        // Write tx -> block mappings
+        for (tx_hash, block) in &self.tx_blocks {
+            tx.inner.put(tx_blocks_dbi, tx_hash.as_slice(), &block.to_be_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Write transfers - indexed by both address and token
+        for transfer in &self.transfers {
+            // Serialize transfer
+            let transfer_bytes = bincode::serialize(transfer)
+                .map_err(|e| eyre::eyre!("Failed to serialize transfer: {}", e))?;
+
+            // Index by from address
+            let from_key = AddressTransferKey::new(
+                Address::from(transfer.from),
+                transfer.block_number,
+                transfer.log_index,
+            );
+            tx.inner.put(addr_transfers_dbi, from_key.encode(), &transfer_bytes, WriteFlags::UPSERT)?;
+
+            // Index by to address (if different)
+            if transfer.from != transfer.to {
+                let to_key = AddressTransferKey::new(
+                    Address::from(transfer.to),
+                    transfer.block_number,
+                    transfer.log_index,
+                );
+                tx.inner.put(addr_transfers_dbi, to_key.encode(), &transfer_bytes, WriteFlags::UPSERT)?;
+            }
+
+            // Index by token address
+            let token_key = TokenTransferKey::new(
+                Address::from(transfer.token_address),
+                transfer.block_number,
+                transfer.log_index,
+            );
+            tx.inner.put(token_transfers_dbi, token_key.encode(), &transfer_bytes, WriteFlags::UPSERT)?;
+        }
+
+        // Update counters
+        for (name, delta) in &self.counter_deltas {
+            // Read current value, add delta, write back
+            let current: i64 = match tx.inner.get::<Vec<u8>>(counters_dbi, name.as_slice()) {
+                Ok(Some(bytes)) if bytes.len() >= 8 => {
+                    i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                }
+                _ => 0,
+            };
+            let new_value = current + delta;
+            tx.inner.put(counters_dbi, name.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Update address-specific counters
+        for (key, delta) in &self.address_counter_deltas {
+            let key_bytes = key.encode();
+            let current: i64 = match tx.inner.get::<Vec<u8>>(addr_counters_dbi, key_bytes.as_slice()) {
+                Ok(Some(bytes)) if bytes.len() >= 8 => {
+                    i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                }
+                _ => 0,
+            };
+            let new_value = current + delta;
+            tx.inner.put(addr_counters_dbi, key_bytes.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Update daily metrics
+        for (key, value) in &self.daily_metrics {
+            let key_bytes = key.encode();
+            let current: i64 = match tx.inner.get::<Vec<u8>>(daily_metrics_dbi, key_bytes.as_slice()) {
+                Ok(Some(bytes)) if bytes.len() >= 8 => {
+                    i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                }
+                _ => 0,
+            };
+            let new_value = current + value;
+            tx.inner.put(daily_metrics_dbi, key_bytes.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Update last indexed block in metadata
+        tx.inner.put(metadata_dbi, b"last_block", &last_block.to_be_bytes(), WriteFlags::UPSERT)?;
 
         tx.commit()?;
         Ok(())
