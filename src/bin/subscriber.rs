@@ -14,7 +14,10 @@ use serde::Deserialize;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "fdb")]
 use blockscout_exex::fdb_index::{FdbIndex, TokenTransfer};
+#[cfg(not(feature = "fdb"))]
+use blockscout_exex::TokenTransfer;
 use blockscout_exex::transform::{decode_token_transfer, TokenType};
 
 #[derive(Parser)]

@@ -8,6 +8,7 @@ description = "Blockscout-compatible indexer as a Reth ExEx sidecar"
 [[bin]]
 name = "blockscout-exex"
 path = "src/main.rs"
+required-features = ["fdb"]
 
 [[bin]]
 name = "blockscout-backfill"
@@ -20,10 +21,12 @@ path = "src/bin/api.rs"
 [[bin]]
 name = "blockscout-subscriber"
 path = "src/bin/subscriber.rs"
+required-features = ["fdb"]
 
 [[bin]]
 name = "blockscout-migrate"
 path = "src/bin/migrate.rs"
+required-features = ["fdb"]
 
 [dependencies]
 # Database - FoundationDB for distributed key-value storage

@@ -404,18 +404,21 @@ impl MdbxIndex {
     /// Returns 1 for new databases or stored version
     #[cfg(feature = "reth")]
     pub fn get_schema_version(&self) -> Result<u32> {
-        use reth_db_api::table::Table;
-        use reth_db_api::cursor::DbCursorRO;
-
         let tx = self.env.tx()?;
 
-        // Use reth's Table trait to access metadata table
-        // We'll store schema_version as a simple key-value pair
-        // For simplicity, using a direct get approach
-        // In a real implementation, we'd define proper table types
+        // Try to open metadata table (may not exist yet)
+        let metadata_db = match tx.inner.open_db(Some(tables::METADATA)) {
+            Ok(db) => db,
+            Err(_) => return Ok(SCHEMA_VERSION), // Table doesn't exist yet
+        };
 
-        // For now, return default version until we set it
-        Ok(SCHEMA_VERSION)
+        match tx.inner.get::<Vec<u8>>(metadata_db.dbi(), b"schema_version") {
+            Ok(Some(bytes)) if bytes.len() >= 4 => {
+                let version = u32::from_be_bytes(bytes[..4].try_into().unwrap_or([0u8; 4]));
+                Ok(version)
+            }
+            _ => Ok(SCHEMA_VERSION),
+        }
     }
 
     #[cfg(not(feature = "reth"))]
@@ -428,10 +431,8 @@ impl MdbxIndex {
     pub fn set_schema_version(&self, version: u32) -> Result<()> {
         let tx = self.env.tx_mut()?;
 
-        // Store version in metadata
-        // For now, just commit the transaction
-        // In production, we'd write to a proper metadata table
-
+        let metadata_db = tx.inner.create_db(Some(tables::METADATA), reth_libmdbx::DatabaseFlags::default())?;
+        tx.inner.put(metadata_db.dbi(), b"schema_version", &version.to_be_bytes(), reth_libmdbx::WriteFlags::UPSERT)?;
         tx.commit()?;
         Ok(())
     }
@@ -468,8 +469,11 @@ impl MdbxIndex {
 
     /// Set last indexed block in metadata
     #[cfg(feature = "reth")]
-    pub fn set_last_indexed_block(&self, _block: u64) -> Result<()> {
+    pub fn set_last_indexed_block(&self, block: u64) -> Result<()> {
         let tx = self.env.tx_mut()?;
+
+        let metadata_db = tx.inner.create_db(Some(tables::METADATA), reth_libmdbx::DatabaseFlags::default())?;
+        tx.inner.put(metadata_db.dbi(), b"last_block", &block.to_be_bytes(), reth_libmdbx::WriteFlags::UPSERT)?;
         tx.commit()?;
         Ok(())
     }
@@ -940,9 +944,23 @@ impl MdbxIndex {
 
     /// Get daily metric
     #[cfg(feature = "reth")]
-    pub fn get_daily_metric(&self, _year: u16, _month: u8, _day: u8, _metric: u8) -> Result<i64> {
-        // Placeholder implementation
-        Ok(0)
+    pub fn get_daily_metric(&self, year: u16, month: u8, day: u8, metric: u8) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let daily_metrics_db = match tx.inner.open_db(Some(tables::DAILY_METRICS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        let key = DailyMetricKey::new(year, month, day, metric);
+        let key_bytes = key.encode();
+
+        match tx.inner.get::<Vec<u8>>(daily_metrics_db.dbi(), key_bytes.as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
     }
 
     #[cfg(not(feature = "reth"))]
@@ -1251,6 +1269,46 @@ impl MdbxWriteBatch {
             };
             let new_value = current + value;
             tx.inner.put(daily_metrics_dbi, key_bytes.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Write holder balances and update holder counts
+        if !self.holder_updates.is_empty() {
+            let holders_dbi = tx.inner.create_db(Some(tables::TOKEN_HOLDERS), DatabaseFlags::default())?.dbi();
+            let holder_counts_dbi = tx.inner.create_db(Some(tables::TOKEN_HOLDER_COUNTS), DatabaseFlags::default())?.dbi();
+
+            // Track holder count changes per token
+            let mut holder_count_deltas: std::collections::HashMap<Address, i64> = std::collections::HashMap::new();
+
+            for (key, new_balance, old_balance) in &self.holder_updates {
+                let key_bytes = key.encode();
+
+                // Write the balance
+                tx.inner.put(holders_dbi, key_bytes.as_slice(), &new_balance.to_be_bytes::<32>(), WriteFlags::UPSERT)?;
+
+                // Track holder count changes
+                let was_holder = old_balance.map(|b| !b.is_zero()).unwrap_or(false);
+                let is_holder = !new_balance.is_zero();
+
+                if !was_holder && is_holder {
+                    // New holder
+                    *holder_count_deltas.entry(key.token()).or_insert(0) += 1;
+                } else if was_holder && !is_holder {
+                    // Lost holder
+                    *holder_count_deltas.entry(key.token()).or_insert(0) -= 1;
+                }
+            }
+
+            // Update holder counts
+            for (token, delta) in holder_count_deltas {
+                let current: i64 = match tx.inner.get::<Vec<u8>>(holder_counts_dbi, token.as_slice()) {
+                    Ok(Some(bytes)) if bytes.len() >= 8 => {
+                        i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                    }
+                    _ => 0,
+                };
+                let new_count = (current + delta).max(0);
+                tx.inner.put(holder_counts_dbi, token.as_slice(), &new_count.to_le_bytes(), WriteFlags::UPSERT)?;
+            }
         }
 
         // Update last indexed block in metadata

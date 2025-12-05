@@ -2,7 +2,7 @@
 //!
 //! Following TDD approach: RED -> GREEN -> REFACTOR
 
-use blockscout_exex::fdb_index::TokenTransfer;
+use blockscout_exex::TokenTransfer;
 use alloy_primitives::{Address, TxHash, U256};
 use std::path::PathBuf;
 use tempfile::TempDir;

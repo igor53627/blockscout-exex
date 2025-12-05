@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 mod api;
+#[cfg(feature = "fdb")]
 mod fdb_index;
 mod meili;
 #[cfg(feature = "reth")]
