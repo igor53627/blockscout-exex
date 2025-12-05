@@ -6,18 +6,22 @@
 //! - `\x03<token:20>/<holder:20>` → balance:32 (token_holders)
 //! - `\x04<tx_hash:32>` → block_num:8 (tx_block)
 //! - `\x05last_block` → u64 (meta)
+//! - `\x05address_hll` → HyperLogLog bytes (meta, ~12KB, unique address estimate)
 //! - `\x06<counter_name>` → i64_le (counters: total_txs, total_addresses, total_transfers)
 //! - `\x08<token:20>/<block:8><log_idx:8>` → transfer (token_transfers)
 //! - `\x09<address:20><kind:1>` → i64_le (address_counters: 0=tx, 1=token_transfer)
 //! - `\x0A<token:20>` → i64_le (token_holder_counts)
 //! - `\x0B<yyyy:2><mm:1><dd:1><metric:1>` → i64_le (daily_metrics: 0=txs, 1=transfers)
 
+use std::collections::hash_map::RandomState;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use alloy_primitives::{Address, TxHash, U256};
 use eyre::Result;
 use foundationdb::options::MutationType;
 use foundationdb::{Database, RangeOption};
+use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use serde::{Deserialize, Serialize};
 
 // Key prefixes for different tables
@@ -33,9 +37,32 @@ const PREFIX_TOKEN_HOLDER_COUNTS: u8 = 0x0A;
 const PREFIX_DAILY_METRICS: u8 = 0x0B;
 
 const META_LAST_BLOCK: &[u8] = b"last_block";
+const META_ADDRESS_HLL: &[u8] = b"address_hll";
 const COUNTER_TOTAL_TXS: &[u8] = b"total_txs";
 const COUNTER_TOTAL_ADDRESSES: &[u8] = b"total_addresses";
 const COUNTER_TOTAL_TRANSFERS: &[u8] = b"total_transfers";
+
+/// HyperLogLog precision (p=14 gives ~0.8% error with ~12KB storage)
+const HLL_PRECISION: u8 = 14;
+
+/// Type alias for our address HLL
+pub type AddressHll = HyperLogLogPlus<AddressWrapper, RandomState>;
+
+/// Wrapper to make Address hashable for HLL
+#[derive(Clone, Copy)]
+pub struct AddressWrapper(pub Address);
+
+impl Hash for AddressWrapper {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_slice().hash(state);
+    }
+}
+
+impl From<Address> for AddressWrapper {
+    fn from(addr: Address) -> Self {
+        Self(addr)
+    }
+}
 
 // Address counter kinds
 const ADDR_COUNTER_TX: u8 = 0;
@@ -318,6 +345,58 @@ impl FdbIndex {
         Ok(())
     }
 
+    // HyperLogLog operations for unique address counting
+
+    /// Create a new empty HyperLogLog for address counting
+    pub fn new_address_hll() -> AddressHll {
+        HyperLogLogPlus::new(HLL_PRECISION, RandomState::new()).unwrap()
+    }
+
+    /// Load the address HLL count from FDB (we store just the count, not the full HLL)
+    /// Returns (count, needs_rebuild) - if needs_rebuild is true, caller should rebuild HLL
+    pub async fn load_address_hll_count(&self) -> Result<u64> {
+        let key = Self::meta_key(META_ADDRESS_HLL);
+        let result = self
+            .db
+            .run(|trx, _| {
+                let key = key.clone();
+                async move { Ok(trx.get(&key, false).await?) }
+            })
+            .await?;
+
+        match result {
+            Some(value) if value.len() == 8 => {
+                let bytes: [u8; 8] = value.as_ref().try_into()?;
+                Ok(u64::from_le_bytes(bytes))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Save the address HLL count to FDB (just the count, not the full structure)
+    pub async fn save_address_hll_count(&self, count: u64) -> Result<()> {
+        let key = Self::meta_key(META_ADDRESS_HLL);
+        let value = count.to_le_bytes();
+        
+        tracing::debug!("Saving address HLL count: ~{} addresses", count);
+        
+        self.db
+            .run(|trx, _| {
+                let key = key.clone();
+                async move {
+                    trx.set(&key, &value);
+                    Ok(())
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Get the estimated unique address count from HLL
+    pub async fn get_address_count_hll(&self) -> Result<u64> {
+        self.load_address_hll_count().await
+    }
+
     // Counter operations
 
     async fn get_counter(&self, name: &[u8]) -> Result<u64> {
@@ -331,11 +410,12 @@ impl FdbIndex {
             .await?;
 
         match result {
-            Some(value) => {
+            Some(value) if value.len() == 8 => {
                 let bytes: [u8; 8] = value.as_ref().try_into()?;
-                Ok(u64::from_be_bytes(bytes))
+                // Counters are stored as i64 little-endian (via atomic add)
+                Ok(i64::from_le_bytes(bytes) as u64)
             }
-            None => Ok(0),
+            _ => Ok(0),
         }
     }
 
@@ -349,6 +429,81 @@ impl FdbIndex {
 
     pub async fn get_total_transfers(&self) -> Result<u64> {
         self.get_counter(COUNTER_TOTAL_TRANSFERS).await
+    }
+
+    /// Count unique addresses by scanning address counter keys.
+    /// This scans all \x09<address><kind=0> keys to count unique addresses.
+    pub async fn count_unique_addresses(&self) -> Result<u64> {
+        let mut start_key = vec![PREFIX_ADDRESS_COUNTERS];
+        let end_key = vec![PREFIX_ADDRESS_COUNTERS + 1];
+        let mut count = 0u64;
+        let mut last_address: Option<[u8; 20]> = None;
+
+        loop {
+            let range = RangeOption {
+                limit: Some(10000),
+                ..RangeOption::from(start_key.as_slice()..end_key.as_slice())
+            };
+
+            let results = self
+                .db
+                .run(|trx, _| {
+                    let range = range.clone();
+                    async move {
+                        let kvs = trx.get_range(&range, 1, false).await?;
+                        Ok(kvs.into_iter().collect::<Vec<_>>())
+                    }
+                })
+                .await?;
+
+            if results.is_empty() {
+                break;
+            }
+
+            for kv in &results {
+                let key = kv.key();
+                // Key format: prefix(1) + address(20) + kind(1)
+                if key.len() == 22 {
+                    let addr: [u8; 20] = key[1..21].try_into().unwrap();
+                    // Only count each address once (we may have multiple counter types)
+                    if last_address.as_ref() != Some(&addr) {
+                        count += 1;
+                        last_address = Some(addr);
+                    }
+                }
+            }
+
+            // Move to next batch
+            if let Some(last_kv) = results.last() {
+                start_key = last_kv.key().to_vec();
+                start_key.push(0); // Move past this key
+            } else {
+                break;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Update the total addresses counter by scanning and counting unique addresses.
+    pub async fn refresh_address_count(&self) -> Result<u64> {
+        let count = self.count_unique_addresses().await?;
+        
+        // Set the counter directly (not atomic add, just set)
+        let key = Self::counter_key(COUNTER_TOTAL_ADDRESSES);
+        let value = (count as i64).to_le_bytes();
+        
+        self.db
+            .run(|trx, _| {
+                let key = key.clone();
+                async move {
+                    trx.set(&key, &value);
+                    Ok(())
+                }
+            })
+            .await?;
+        
+        Ok(count)
     }
 
     pub async fn get_address_tx_count(&self, address: &Address) -> Result<u64> {
@@ -808,6 +963,19 @@ impl<'a> WriteBatch<'a> {
         *self.daily_transfer_counts.entry(key).or_insert(0) += transfer_count;
     }
 
+    /// Collect all unique addresses from this batch for HLL insertion
+    pub fn collect_addresses(&self) -> impl Iterator<Item = Address> + '_ {
+        // Addresses from transactions
+        let tx_addrs = self.address_txs.iter().map(|(addr, _, _, _)| *addr);
+        
+        // Addresses from transfers (from + to)
+        let transfer_addrs = self.transfers.iter().flat_map(|t| {
+            [Address::from(t.from), Address::from(t.to)]
+        });
+        
+        tx_addrs.chain(transfer_addrs)
+    }
+
     /// Estimate the transaction size in bytes
     fn estimate_size(&self) -> usize {
         // Key sizes: address(20) + block(8) + idx(4) = 32 + prefix
@@ -829,24 +997,36 @@ impl<'a> WriteBatch<'a> {
 
     /// Check if batch is approaching FDB transaction size limit
     pub fn is_large(&self) -> bool {
-        // Estimate size: addr_txs ~65 bytes each, transfers ~500 bytes each (3 indexes)
-        // FDB limit is 10MB, we target <5MB to be safe
+        // Estimate sizes per entry:
+        // - addr_txs: ~65 bytes (key + tx_hash)
+        // - tx_blocks: ~40 bytes (key + block_num)
+        // - transfers: ~500 bytes (3 indexes × ~160 bytes each)
+        // - holder_updates: ~75 bytes (key + balance)
+        // FDB limit is 10MB, we target <4MB to be safe
         let addr_tx_bytes = self.address_txs.len() * 65;
+        let tx_block_bytes = self.tx_blocks.len() * 40;
         let transfer_bytes = self.transfers.len() * 500;
-        let total = addr_tx_bytes + transfer_bytes;
-        total > 4_000_000 // 4MB threshold
+        let holder_bytes = self.holder_updates.len() * 75;
+        let total = addr_tx_bytes + tx_block_bytes + transfer_bytes + holder_bytes;
+        total > 2_000_000 // 2MB threshold (FDB limit is 10MB, be conservative)
     }
 
     pub async fn commit(self, last_block: u64) -> Result<()> {
-        const MAX_WRITES: usize = 50000; // ~3MB at 60 bytes per write average
+        const MAX_WRITES: usize = 20000; // ~2MB at 100 bytes per write average (conservative)
         
-        let total_writes = self.address_txs.len() + self.tx_blocks.len() + (self.transfers.len() * 3);
+        // Count all write operations (transfers write 3 entries each: from, to, token)
+        let total_writes = self.address_txs.len() 
+            + self.tx_blocks.len() 
+            + (self.transfers.len() * 3)
+            + self.holder_updates.len();
         
-        tracing::debug!(
+        tracing::info!(
             transfers = self.transfers.len(),
             txs = self.tx_blocks.len(),
             addr_txs = self.address_txs.len(),
+            holders = self.holder_updates.len(),
             total_writes = total_writes,
+            last_block = last_block,
             "Committing batch"
         );
         
@@ -1004,19 +1184,28 @@ impl<'a> WriteBatch<'a> {
         
         let total_addr_txs = self.address_txs.len();
         let total_transfers = self.transfers.len();
+        let total_holders = self.holder_updates.len();
         
-        // Split into chunks
+        // Split into chunks - all data types need chunking
         let mut addr_tx_iter = self.address_txs.into_iter();
         let mut tx_block_iter = self.tx_blocks.into_iter();
         let mut transfer_iter = self.transfers.into_iter();
+        let mut holder_iter = self.holder_updates.into_iter();
+        
+        // Counters/metrics go in first chunk only (they're small)
+        let daily_tx_counts: Vec<_> = self.daily_tx_counts.into_iter().collect();
+        let daily_transfer_counts: Vec<_> = self.daily_transfer_counts.into_iter().collect();
+        let address_tx_increments: Vec<_> = self.address_tx_increments.into_iter().collect();
+        let address_transfer_increments: Vec<_> = self.address_transfer_increments.into_iter().collect();
         
         let mut chunk_num = 0;
         loop {
             let addr_txs: Vec<_> = addr_tx_iter.by_ref().take(CHUNK_SIZE).collect();
             let tx_blocks: Vec<_> = tx_block_iter.by_ref().take(CHUNK_SIZE).collect();
             let transfers: Vec<_> = transfer_iter.by_ref().take(CHUNK_SIZE / 3).collect(); // 3 writes per transfer
+            let holders: Vec<_> = holder_iter.by_ref().take(CHUNK_SIZE).collect();
             
-            if addr_txs.is_empty() && tx_blocks.is_empty() && transfers.is_empty() {
+            if addr_txs.is_empty() && tx_blocks.is_empty() && transfers.is_empty() && holders.is_empty() {
                 break;
             }
             
@@ -1026,6 +1215,7 @@ impl<'a> WriteBatch<'a> {
                 addr_txs = addr_txs.len(),
                 tx_blocks = tx_blocks.len(),
                 transfers = transfers.len(),
+                holders = holders.len(),
                 "Committing chunk"
             );
             
@@ -1034,11 +1224,11 @@ impl<'a> WriteBatch<'a> {
                 addr_txs,
                 tx_blocks,
                 transfers,
-                if chunk_num == 1 { self.holder_updates.clone() } else { Vec::new() },
-                if chunk_num == 1 { self.daily_tx_counts.clone().into_iter().collect() } else { Vec::new() },
-                if chunk_num == 1 { self.daily_transfer_counts.clone().into_iter().collect() } else { Vec::new() },
-                if chunk_num == 1 { self.address_tx_increments.clone().into_iter().collect() } else { Vec::new() },
-                if chunk_num == 1 { self.address_transfer_increments.clone().into_iter().collect() } else { Vec::new() },
+                holders,
+                if chunk_num == 1 { daily_tx_counts.clone() } else { Vec::new() },
+                if chunk_num == 1 { daily_transfer_counts.clone() } else { Vec::new() },
+                if chunk_num == 1 { address_tx_increments.clone() } else { Vec::new() },
+                if chunk_num == 1 { address_transfer_increments.clone() } else { Vec::new() },
                 last_block,
             ).await?;
         }
@@ -1047,6 +1237,7 @@ impl<'a> WriteBatch<'a> {
             chunks = chunk_num,
             total_addr_txs = total_addr_txs,
             total_transfers = total_transfers,
+            total_holders = total_holders,
             "Chunked commit complete"
         );
         
@@ -1224,10 +1415,118 @@ impl<'a> WriteBatch<'a> {
 
 /// Initialize the FDB network. Must be called once before using FdbIndex.
 /// Returns a guard that should be kept alive for the duration of the program.
-/// 
+///
 /// # Safety
 /// This is marked unsafe because the network must be shut down before the
 /// program exits. The returned guard handles this automatically when dropped.
 pub unsafe fn init_fdb_network() -> foundationdb::api::NetworkAutoStop {
     foundationdb::boot()
+}
+
+// ============================================================================
+// IndexDatabase Trait Implementation (Task 4.2)
+// ============================================================================
+
+use async_trait::async_trait;
+use crate::index_trait::IndexDatabase;
+
+#[async_trait]
+impl IndexDatabase for FdbIndex {
+    async fn last_indexed_block(&self) -> Result<Option<u64>> {
+        self.last_indexed_block().await
+    }
+
+    async fn get_address_txs(
+        &self,
+        address: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<TxHash>> {
+        self.get_address_txs(address, limit, offset).await
+    }
+
+    async fn get_address_transfers(
+        &self,
+        address: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::index_trait::TokenTransfer>> {
+        // Convert from fdb_index::TokenTransfer to index_trait::TokenTransfer
+        let transfers = self.get_address_transfers(address, limit, offset).await?;
+        Ok(transfers.into_iter().map(|t| crate::index_trait::TokenTransfer {
+            tx_hash: t.tx_hash,
+            log_index: t.log_index,
+            token_address: t.token_address,
+            from: t.from,
+            to: t.to,
+            value: t.value,
+            block_number: t.block_number,
+            timestamp: t.timestamp,
+            token_type: t.token_type,
+            token_id: t.token_id,
+        }).collect())
+    }
+
+    async fn get_token_holders(
+        &self,
+        token: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(Address, U256)>> {
+        self.get_token_holders(token, limit, offset).await
+    }
+
+    async fn get_token_transfers(
+        &self,
+        token: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::index_trait::TokenTransfer>> {
+        // Convert from fdb_index::TokenTransfer to index_trait::TokenTransfer
+        let transfers = self.get_token_transfers(token, limit, offset).await?;
+        Ok(transfers.into_iter().map(|t| crate::index_trait::TokenTransfer {
+            tx_hash: t.tx_hash,
+            log_index: t.log_index,
+            token_address: t.token_address,
+            from: t.from,
+            to: t.to,
+            value: t.value,
+            block_number: t.block_number,
+            timestamp: t.timestamp,
+            token_type: t.token_type,
+            token_id: t.token_id,
+        }).collect())
+    }
+
+    async fn get_tx_block(&self, tx_hash: &TxHash) -> Result<Option<u64>> {
+        self.get_tx_block(tx_hash).await
+    }
+
+    async fn get_total_txs(&self) -> Result<u64> {
+        self.get_total_txs().await
+    }
+
+    async fn get_total_addresses(&self) -> Result<u64> {
+        self.get_total_addresses().await
+    }
+
+    async fn get_total_transfers(&self) -> Result<u64> {
+        self.get_total_transfers().await
+    }
+
+    async fn get_address_tx_count(&self, address: &Address) -> Result<u64> {
+        self.get_address_tx_count(address).await
+    }
+
+    async fn get_address_transfer_count(&self, address: &Address) -> Result<u64> {
+        self.get_address_token_transfer_count(address).await
+    }
+
+    async fn get_token_holder_count(&self, token: &Address) -> Result<u64> {
+        self.get_token_holder_count(token).await
+    }
+
+    async fn get_daily_tx_metrics(&self, days: usize) -> Result<Vec<(String, u64)>> {
+        self.get_daily_tx_metrics(days).await
+    }
 }

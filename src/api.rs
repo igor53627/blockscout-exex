@@ -14,19 +14,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
-use crate::fdb_index::FdbIndex;
+use crate::index_trait::IndexDatabase;
 pub use crate::meili::SearchClient;
 #[cfg(feature = "reth")]
 use crate::reth_reader::RethReader;
+use crate::rpc_executor::RpcExecutor;
 use crate::websocket::{websocket_handler, Broadcaster};
 
 pub struct ApiState {
-    pub index: Arc<FdbIndex>,
+    pub index: Arc<dyn IndexDatabase>,
     #[cfg(feature = "reth")]
     pub reth: Option<RethReader>,
     pub broadcaster: Broadcaster,
     pub rpc_url: Option<String>,
     pub search: Option<SearchClient>,
+    pub rpc_executor: Option<Arc<RpcExecutor>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +94,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/v2/main-page/transactions", get(homepage_txs))
         .route("/api/v2/search", get(search))
         .route("/api/v2/search/quick", get(search_quick))
+        .route("/api/v2/health", get(health_check))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -112,14 +115,31 @@ async fn stats(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         .and_then(|r| r.last_block_number().ok().flatten())
         .unwrap_or(0);
     #[cfg(not(feature = "reth"))]
-    let last_block = state.index.last_indexed_block().await.unwrap_or(None).unwrap_or(0);
+    let last_block = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.last_indexed_block()
+    ).await.unwrap_or(Ok(None)).unwrap_or(None).unwrap_or(0);
 
-    let total_txs = state.index.get_total_txs().await.unwrap_or(0);
-    let total_transfers = state.index.get_total_transfers().await.unwrap_or(0);
+    // Use timeout to prevent blocking if FDB is slow
+    let total_txs = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.get_total_txs()
+    ).await.unwrap_or(Ok(0)).unwrap_or(0);
+    
+    let total_transfers = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.get_total_transfers()
+    ).await.unwrap_or(Ok(0)).unwrap_or(0);
+    
+    // Use total addresses count
+    let total_addresses = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.get_total_addresses()
+    ).await.unwrap_or(Ok(0)).unwrap_or(0);
 
     Json(json!({
         "total_blocks": last_block.to_string(),
-        "total_addresses": "0",
+        "total_addresses": total_addresses.to_string(),
         "total_transactions": total_txs.to_string(),
         "average_block_time": 12000.0,
         "coin_price": null,
@@ -915,7 +935,7 @@ async fn tx_state_changes(
             }
             
             // Try to get state diff using debug_traceTransaction
-            let trace_result = trace_tx_state_diff(rpc_url, &hash).await;
+            let trace_result = trace_tx_state_diff(&state, &hash).await;
             
             if let Ok(state_diff) = trace_result {
                 let items = parse_state_diff(&state_diff, &tx);
@@ -1004,22 +1024,12 @@ async fn tx_state_changes(
 }
 
 // Helper to trace transaction state diff
-async fn trace_tx_state_diff(rpc_url: &str, tx_hash: &str) -> Result<Value, ()> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "debug_traceTransaction",
-            "params": [tx_hash, {"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}],
-            "id": 1
-        }))
-        .send()
+async fn trace_tx_state_diff(state: &ApiState, tx_hash: &str) -> Result<Value, ()> {
+    let params = json!([tx_hash, {"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}]);
+
+    execute_rpc_call(state, "debug_traceTransaction", params)
         .await
-        .map_err(|_| ())?;
-    
-    let body: Value = resp.json().await.map_err(|_| ())?;
-    Ok(body["result"].clone())
+        .map_err(|_| ())
 }
 
 // Parse state diff into Blockscout format
@@ -1233,7 +1243,7 @@ async fn address_counters(
     
     // Use atomic counters from FDB (O(1) lookup instead of range scan)
     let tx_count = state.index.get_address_tx_count(&addr).await.unwrap_or(0);
-    let transfer_count = state.index.get_address_token_transfer_count(&addr).await.unwrap_or(0);
+    let transfer_count = state.index.get_address_transfer_count(&addr).await.unwrap_or(0);
     
     Json(json!({
         "transactions_count": tx_count.to_string(),
@@ -1263,7 +1273,7 @@ async fn address_tabs_counters(
     
     // Use atomic counters from FDB (O(1) lookup instead of range scan)
     let tx_count = state.index.get_address_tx_count(&addr).await.unwrap_or(0);
-    let transfer_count = state.index.get_address_token_transfer_count(&addr).await.unwrap_or(0);
+    let transfer_count = state.index.get_address_transfer_count(&addr).await.unwrap_or(0);
     
     Json(json!({
         "internal_transactions_count": 0,
@@ -1290,15 +1300,9 @@ async fn token_by_hash(
         // Fetch total supply
         let total_supply = fetch_token_total_supply(rpc_url, &hash).await;
         
-        // Try atomic holder count first, fall back to range scan
+        // Get atomic holder count
         let holders_count = if let Ok(addr) = hash.parse::<Address>() {
-            let count = state.index.get_token_holder_count(&addr).await.unwrap_or(0);
-            if count > 0 {
-                count as usize
-            } else {
-                // Fallback to range scan for data indexed before Phase 4
-                state.index.count_token_holders(&addr, MAX_COUNT_CAP).await.unwrap_or(0)
-            }
+            state.index.get_token_holder_count(&addr).await.unwrap_or(0) as usize
         } else {
             0
         };
@@ -1449,9 +1453,10 @@ async fn token_counters(
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
     let (holders_count, transfers_count) = if let Ok(addr) = hash.parse::<Address>() {
-        let holders = state.index.count_token_holders(&addr, MAX_COUNT_CAP).await.unwrap_or(0);
-        let transfers = state.index.count_token_transfers(&addr, MAX_COUNT_CAP).await.unwrap_or(0);
-        (holders, transfers)
+        let holders = state.index.get_token_holder_count(&addr).await.unwrap_or(0) as usize;
+        // Note: transfers count would require scanning or a new counter
+        // For now, return 0 as this is a stub endpoint
+        (holders, 0)
     } else {
         (0, 0)
     };
@@ -1828,6 +1833,58 @@ async fn fetch_block_receipts_rpc(rpc_url: &str, block_param: &str) -> Result<Va
         .json::<Value>()
         .await?;
     Ok(resp["result"].clone())
+}
+
+/// Execute RPC call using the executor if available, otherwise fall back to direct reqwest
+async fn execute_rpc_call(
+    state: &ApiState,
+    method: &str,
+    params: Value,
+) -> Result<Value, eyre::Report> {
+    let rpc_url = state.rpc_url.as_ref().ok_or_else(|| eyre::eyre!("RPC URL not configured"))?;
+
+    // Try using the executor if available
+    if let Some(ref executor) = state.rpc_executor {
+        use crate::rpc_executor::RpcRequest;
+
+        let request = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+            id: 1,
+        };
+
+        let response = executor.execute(rpc_url, request).await?;
+
+        if let Some(error) = response.error {
+            return Err(eyre::eyre!("RPC error: {}", error));
+        }
+
+        response.result.ok_or_else(|| eyre::eyre!("No result in RPC response"))
+    } else {
+        // Fallback to direct reqwest call
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": 1
+            }))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        if let Some(error) = resp.get("error") {
+            return Err(eyre::eyre!("RPC error: {}", error));
+        }
+
+        resp.get("result")
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("No result in RPC response"))
+    }
 }
 
 fn hex_to_u128(hex: &str) -> u128 {
@@ -2321,6 +2378,55 @@ fn stub_token(hash: &str) -> Value {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn health_check(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    // Health check endpoint with database connectivity status
+    // Returns 200 OK if database is accessible, 503 SERVICE_UNAVAILABLE if not
+
+    match state.index.last_indexed_block().await {
+        Ok(Some(block)) => {
+            // Database is accessible and has data
+            let backend = if cfg!(feature = "mdbx") {
+                "mdbx"
+            } else if cfg!(feature = "fdb") {
+                "fdb"
+            } else {
+                "unknown"
+            };
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "healthy",
+                    "last_block": block,
+                    "backend": backend
+                }))
+            )
+        }
+        Ok(None) => {
+            // Database is accessible but no data yet (initializing)
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "initializing",
+                    "last_block": null,
+                    "backend": if cfg!(feature = "mdbx") { "mdbx" } else { "fdb" }
+                }))
+            )
+        }
+        Err(e) => {
+            // Database is not accessible
+            tracing::error!("Health check failed: {}", e);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "unhealthy",
+                    "error": "database_unavailable"
+                }))
+            )
+        }
+    }
 }
 
 async fn indexing_status(State(state): State<Arc<ApiState>>) -> impl IntoResponse {

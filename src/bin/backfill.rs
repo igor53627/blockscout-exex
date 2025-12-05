@@ -1,9 +1,13 @@
-//! Backfill tool - indexes blockchain data into FoundationDB
+//! Backfill tool - indexes blockchain data into FoundationDB or MDBX
 //!
 //! Supports multiple modes:
 //! - HTTP JSON-RPC mode (default): fetches via HTTP
 //! - IPC mode (--ipc-path): fetches via Unix socket, faster than HTTP
 //! - Direct MDBX mode (--reth-db): reads reth database directly, fastest
+//!
+//! Target database:
+//! - FoundationDB (default): uses --cluster-file
+//! - MDBX index: uses --mdbx-path
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -14,13 +18,18 @@ use eyre::Result;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use blockscout_exex::fdb_index::{FdbIndex, TokenTransfer};
+#[cfg(feature = "fdb")]
+use blockscout_exex::fdb_index::{AddressWrapper, FdbIndex, TokenTransfer};
+use blockscout_exex::IndexDatabase;
+#[cfg(feature = "mdbx")]
+use blockscout_exex::mdbx_index::MdbxIndex;
 use blockscout_exex::meili::{SearchClient, TokenDocument};
 use blockscout_exex::transform::{decode_token_transfer, TokenType};
+use hyperloglogplus::HyperLogLog;
 
 #[derive(Parser)]
 #[command(name = "blockscout-backfill")]
-#[command(about = "Backfill FoundationDB index from reth")]
+#[command(about = "Backfill FoundationDB or MDBX index from reth")]
 struct Args {
     /// JSON-RPC endpoint URL (used when --ipc-path is not set)
     #[arg(long, default_value = "http://localhost:8545")]
@@ -30,7 +39,7 @@ struct Args {
     #[arg(long)]
     ipc_path: Option<PathBuf>,
 
-    /// Path to reth database directory (enables direct MDBX reading)
+    /// Path to reth database directory (enables direct MDBX reading for source data)
     #[cfg(feature = "reth")]
     #[arg(long)]
     reth_db: Option<PathBuf>,
@@ -48,6 +57,11 @@ struct Args {
     /// FoundationDB cluster file path (uses default if not specified)
     #[arg(long)]
     cluster_file: Option<PathBuf>,
+
+    /// MDBX index database path (mutually exclusive with --cluster-file)
+    #[cfg(feature = "mdbx")]
+    #[arg(long, conflicts_with = "cluster_file")]
+    mdbx_path: Option<PathBuf>,
 
     /// Starting block number (0 = from last indexed + 1)
     #[arg(long, default_value = "0")]
@@ -267,6 +281,13 @@ mod direct {
         let mut processed = 0u64;
         let mut seen_tokens: HashSet<Address> = HashSet::new();
 
+        // Create in-memory HLL for address counting (we just save the count periodically)
+        let mut address_hll = FdbIndex::new_address_hll();
+        let prev_count = index.load_address_hll_count().await.unwrap_or(0);
+        info!("Starting address HLL (previous count: ~{})", prev_count);
+        let mut hll_save_counter = 0u64;
+        const HLL_SAVE_INTERVAL: u64 = 10000; // Save HLL count every 10k blocks
+
         for batch_start in (from_block..=to_block).step_by(batch_size as usize) {
             let batch_end = (batch_start + batch_size - 1).min(to_block);
 
@@ -360,6 +381,10 @@ mod direct {
                 
                 // Commit when batch is getting large (avoid FDB 10MB limit)
                 if batch.is_large() {
+                    // Update HLL with addresses from this batch before commit
+                    for addr in batch.collect_addresses() {
+                        address_hll.insert(&AddressWrapper(addr));
+                    }
                     batch.commit(block_num).await?;
                     batch = index.write_batch();
                 }
@@ -374,9 +399,23 @@ mod direct {
                 }
             }
 
+            // Update HLL with addresses from this batch before commit
+            for addr in batch.collect_addresses() {
+                address_hll.insert(&AddressWrapper(addr));
+            }
+
             // Commit remaining batch
             batch.commit(batch_end).await?;
             debug!(from = batch_start, to = batch_end, "Batch complete");
+
+            // Save HLL count periodically
+            hll_save_counter += batch_size;
+            if hll_save_counter >= HLL_SAVE_INTERVAL {
+                let count = address_hll.count() as u64;
+                index.save_address_hll_count(count).await?;
+                info!("Saved address HLL count (~{} unique addresses)", count);
+                hll_save_counter = 0;
+            }
 
             // Index new tokens to Meilisearch
             if let Some(search) = search {
@@ -392,6 +431,11 @@ mod direct {
                 }
             }
         }
+
+        // Final HLL count save
+        let final_count = address_hll.count() as u64;
+        index.save_address_hll_count(final_count).await?;
+        info!("Final address count: ~{} unique addresses", final_count);
 
         Ok(())
     }
@@ -435,6 +479,13 @@ async fn run_rpc_backfill(
     let total = to_block - from_block + 1;
     let mut processed = 0u64;
     let mut seen_tokens: HashSet<Address> = HashSet::new();
+
+    // Create in-memory HLL for address counting (we just save the count periodically)
+    let mut address_hll = FdbIndex::new_address_hll();
+    let prev_count = index.load_address_hll_count().await.unwrap_or(0);
+    info!("Starting address HLL (previous count: ~{})", prev_count);
+    let mut hll_save_counter = 0u64;
+    const HLL_SAVE_INTERVAL: u64 = 10000; // Save HLL count every 10k blocks
 
     for batch_start in (from_block..=to_block).step_by(batch_size as usize) {
         let batch_end = (batch_start + batch_size - 1).min(to_block);
@@ -538,6 +589,10 @@ async fn run_rpc_backfill(
             
             // Commit when batch is getting large (avoid FDB 10MB limit)
             if batch.is_large() {
+                // Update HLL with addresses from this batch before commit
+                for addr in batch.collect_addresses() {
+                    address_hll.insert(&AddressWrapper(addr));
+                }
                 batch.commit(block_num).await?;
                 batch = index.write_batch();
             }
@@ -552,9 +607,23 @@ async fn run_rpc_backfill(
             }
         }
 
+        // Update HLL with addresses from this batch before commit
+        for addr in batch.collect_addresses() {
+            address_hll.insert(&AddressWrapper(addr));
+        }
+
         // Commit remaining batch
         batch.commit(batch_end).await?;
         debug!(from = batch_start, to = batch_end, "Batch complete");
+
+        // Save HLL count periodically
+        hll_save_counter += batch_size;
+        if hll_save_counter >= HLL_SAVE_INTERVAL {
+            let count = address_hll.count() as u64;
+            index.save_address_hll_count(count).await?;
+            info!("Saved address HLL count (~{} unique addresses)", count);
+            hll_save_counter = 0;
+        }
 
         // Index new tokens to Meilisearch
         if let Some(search) = search {
@@ -570,6 +639,11 @@ async fn run_rpc_backfill(
             }
         }
     }
+
+    // Final HLL count save
+    let final_count = address_hll.count() as u64;
+    index.save_address_hll_count(final_count).await?;
+    info!("Final address count: ~{} unique addresses", final_count);
 
     Ok(())
 }
@@ -666,10 +740,23 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Backend selection note:
+    // The backfill tool currently uses FdbIndex concrete type throughout the codebase.
+    // Full trait-based abstraction would require refactoring run_rpc_backfill and direct module.
+    // For now, we support MDBX via separate code paths (TODO: refactor to use IndexDatabase trait)
+
+    #[cfg(feature = "mdbx")]
+    if args.mdbx_path.is_some() {
+        eyre::bail!("MDBX backend for backfill not yet fully implemented. Use FDB for now. See Task 9 for migration tool.");
+    }
+
     // Initialize FDB network
+    #[cfg(feature = "fdb")]
     let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
 
+    #[cfg(feature = "fdb")]
     info!("Connecting to FoundationDB...");
+    #[cfg(feature = "fdb")]
     let index = match &args.cluster_file {
         Some(path) => {
             info!("Using cluster file: {:?}", path);
@@ -680,6 +767,11 @@ async fn main() -> Result<()> {
             FdbIndex::open_default()?
         }
     };
+
+    #[cfg(not(feature = "fdb"))]
+    {
+        eyre::bail!("Backfill requires FDB feature. Build with --features fdb");
+    }
 
     // Check if using direct MDBX mode
     #[cfg(feature = "reth")]

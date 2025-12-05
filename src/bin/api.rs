@@ -8,17 +8,27 @@ use eyre::Result;
 use serde_json::json;
 
 use blockscout_exex::api::{create_router, ApiState};
+#[cfg(feature = "fdb")]
 use blockscout_exex::fdb_index::FdbIndex;
+use blockscout_exex::IndexDatabase;
+#[cfg(feature = "mdbx")]
+use blockscout_exex::mdbx_index::MdbxIndex;
 use blockscout_exex::meili::SearchClient;
+use blockscout_exex::rpc_executor::RpcExecutor;
 use blockscout_exex::websocket::{create_broadcaster, BroadcastMessage, Broadcaster};
 
 #[derive(Parser)]
 #[command(name = "blockscout-api")]
-#[command(about = "Blockscout-compatible API server backed by FoundationDB")]
+#[command(about = "Blockscout-compatible API server backed by FoundationDB or MDBX")]
 struct Args {
     /// FoundationDB cluster file path (uses default if not specified)
     #[arg(long)]
     cluster_file: Option<PathBuf>,
+
+    /// MDBX database path (mutually exclusive with --cluster-file)
+    #[cfg(feature = "mdbx")]
+    #[arg(long, conflicts_with = "cluster_file")]
+    mdbx_path: Option<PathBuf>,
 
     /// API server port (ignored if --socket is set)
     #[arg(long, default_value = "3000")]
@@ -55,24 +65,68 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Initialize FDB network - must be done once before any FDB operations
-    // Safety: We ensure the network guard is held until program exit
-    let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
+    // Backend selection: MDBX or FDB
+    let index: Arc<dyn IndexDatabase> = {
+        #[cfg(feature = "mdbx")]
+        if let Some(mdbx_path) = &args.mdbx_path {
+            tracing::info!("Using MDBX backend at: {:?}", mdbx_path);
+            Arc::new(MdbxIndex::open(mdbx_path)?)
+        } else {
+            #[cfg(feature = "fdb")]
+            {
+                // Initialize FDB network - must be done once before any FDB operations
+                // Safety: We ensure the network guard is held until program exit
+                let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
 
-    tracing::info!("Connecting to FoundationDB...");
-    let index = match &args.cluster_file {
-        Some(path) => {
-            tracing::info!("Using cluster file: {:?}", path);
-            Arc::new(FdbIndex::open(path)?)
+                tracing::info!("Using FoundationDB backend");
+                match &args.cluster_file {
+                    Some(path) => {
+                        tracing::info!("Using cluster file: {:?}", path);
+                        Arc::new(FdbIndex::open(path)?)
+                    }
+                    None => {
+                        tracing::info!("Using default cluster file");
+                        Arc::new(FdbIndex::open_default()?)
+                    }
+                }
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                eyre::bail!("No backend configured. Build with --features fdb or --features mdbx")
+            }
         }
-        None => {
-            tracing::info!("Using default cluster file");
-            Arc::new(FdbIndex::open_default()?)
+
+        #[cfg(not(feature = "mdbx"))]
+        {
+            #[cfg(feature = "fdb")]
+            {
+                // Initialize FDB network - must be done once before any FDB operations
+                // Safety: We ensure the network guard is held until program exit
+                let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
+
+                tracing::info!("Using FoundationDB backend");
+                match &args.cluster_file {
+                    Some(path) => {
+                        tracing::info!("Using cluster file: {:?}", path);
+                        Arc::new(FdbIndex::open(path)?)
+                    }
+                    None => {
+                        tracing::info!("Using default cluster file");
+                        Arc::new(FdbIndex::open_default()?)
+                    }
+                }
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                eyre::bail!("No backend configured. Build with --features fdb or --features mdbx")
+            }
         }
     };
 
     let last_block = index.last_indexed_block().await?;
     tracing::info!("Last indexed block: {:?}", last_block);
+
+    // Note: Address count refresh is backend-specific and handled internally by each backend
 
     let broadcaster = create_broadcaster();
 
@@ -96,6 +150,20 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Initialize RPC executor with dedicated thread pools
+    let rpc_executor = if args.reth_rpc.is_some() {
+        tracing::info!("Initializing RPC executor with thread pools (light:4, heavy:8, trace:2)");
+        match RpcExecutor::new(4, 8, 2) {
+            Ok(executor) => Some(Arc::new(executor)),
+            Err(e) => {
+                tracing::warn!("Failed to create RPC executor: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = Arc::new(ApiState {
         index,
         #[cfg(feature = "reth")]
@@ -103,6 +171,7 @@ async fn main() -> Result<()> {
         broadcaster,
         rpc_url: args.reth_rpc.clone(),
         search,
+        rpc_executor,
     });
     let router = create_router(state);
 

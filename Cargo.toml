@@ -21,13 +21,18 @@ path = "src/bin/api.rs"
 name = "blockscout-subscriber"
 path = "src/bin/subscriber.rs"
 
+[[bin]]
+name = "blockscout-migrate"
+path = "src/bin/migrate.rs"
+
 [dependencies]
 # Database - FoundationDB for distributed key-value storage
-foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_1"] }
+foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_1"], optional = true }
 
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+async-trait = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -61,8 +66,20 @@ tokio-tungstenite = "0.26"
 # Search
 meilisearch-sdk = "0.27"
 
-# For reading reth DB directly
+# Probabilistic data structures
+hyperloglogplus = "0.4"
+ahash = { version = "0.8", features = ["serde"] }
+
+# Caching
+dashmap = "5.5"
+parking_lot = "0.12"
+
+# Lock-free data structures for buffer pooling
+crossbeam-queue = "0.3"
+
+# For reading reth DB directly and MDBX support
 reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
@@ -71,8 +88,16 @@ reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v
 chrono = "0.4.42"
 
 [features]
-default = []
-reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
+default = ["fdb"]
+fdb = ["foundationdb"]
+mdbx = ["reth"]
+reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-db-api", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "fdb_vs_mdbx"
+harness = false
