@@ -127,7 +127,7 @@ fn test_service_files_have_correct_format() {
 
     // Verify service configuration
     assert!(
-        api_service.contains("ExecStart=/usr/local/bin/blockscout-api"),
+        api_service.contains("ExecStart=/mnt/sepolia/blockscout-exex/bin/blockscout-api"),
         "Service must specify correct ExecStart"
     );
     assert!(

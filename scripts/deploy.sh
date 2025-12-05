@@ -10,12 +10,12 @@ set -e
 # ============================================================================
 
 SERVER="root@aya"
-BINARY_PATH="/usr/local/bin"
+BINARY_PATH="/mnt/sepolia/blockscout-exex/bin"
 CONFIG_PATH="/etc/blockscout"
-DATA_PATH="/var/lib/blockscout/mdbx"
+DATA_PATH="/mnt/sepolia/mdbx"
 SERVICE_PATH="/etc/systemd/system"
 LOG_PATH="/var/log/blockscout"
-BACKUP_PATH="/var/backups/blockscout"
+BACKUP_PATH="/mnt/sepolia/backups"
 
 DRY_RUN=false
 if [[ "$1" == "--dry-run" ]]; then

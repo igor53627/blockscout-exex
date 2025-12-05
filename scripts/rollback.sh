@@ -10,9 +10,9 @@ set -e
 # ============================================================================
 
 SERVER="root@aya"
-BINARY_PATH="/usr/local/bin"
+BINARY_PATH="/mnt/sepolia/blockscout-exex/bin"
 SERVICE_PATH="/etc/systemd/system"
-BACKUP_PATH="/var/backups/blockscout"
+BACKUP_PATH="/mnt/sepolia/backups"
 
 BACKUP_TIMESTAMP="$1"
 
