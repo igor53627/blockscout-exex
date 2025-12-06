@@ -150,10 +150,24 @@ Prefix  Description                 Key Format
 0x02    Address token transfers     <address:20>/<block:8>/<log_idx:8>
 0x03    Token holders               <token:20>/<holder:20>
 0x04    Transaction → block         <tx_hash:32>
-0x05    Metadata                    "last_block"
+0x05    Metadata                    "last_block", "address_hll"
 0x06    Global counters             "total_txs", "total_transfers"
 0x08    Token transfers             <token:20>/<block:8>/<log_idx:8>
+0x09    Address counters            <address:20><kind:1> (0=tx, 1=transfer)
+0x0A    Token holder counts         <token:20>
+0x0B    Daily metrics               <year:2><month:1><day:1><metric:1>
 ```
+
+## Address Counting (HyperLogLog)
+
+The unique address count uses HyperLogLog for fast approximate counting:
+- **In-memory HLL** during backfill (p=14, ~0.8% error, ~12KB RAM)
+- **Count only** stored in FDB at `0x05address_hll` (8 bytes)
+- Saved every 10k blocks during backfill
+- API reads count directly via `get_address_count_hll()`
+
+Note: HLL cannot be serialized (RandomState issue), so we only persist the count.
+If backfill restarts from scratch, HLL rebuilds from zero.
 
 ## Meilisearch Indexes
 
