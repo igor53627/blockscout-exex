@@ -192,17 +192,12 @@ async fn block_watcher(reth_rpc: String, tx: Broadcaster) {
                                     payload: block_payload,
                                 });
 
-                                // Broadcast transactions
-                                if let Some(transactions) = txs {
-                                    for (idx, tx_obj) in transactions.iter().enumerate() {
-                                        let tx_payload = format_tx_for_ws(tx_obj, block_height, idx);
-                                        let _ = tx.send(BroadcastMessage {
-                                            topic: "transactions:new_transaction".to_string(),
-                                            event: "new_transaction".to_string(),
-                                            payload: tx_payload,
-                                        });
-                                    }
-                                }
+                                // Broadcast transaction count (frontend expects { transaction: count })
+                                let _ = tx.send(BroadcastMessage {
+                                    topic: "transactions:new_transaction".to_string(),
+                                    event: "transaction".to_string(),
+                                    payload: json!({ "transaction": tx_count }),
+                                });
                             }
                         }
 
