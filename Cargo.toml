@@ -31,6 +31,14 @@ required-features = ["fdb"]
 name = "update-counters"
 path = "src/bin/update_counters.rs"
 
+[[bin]]
+name = "index-tokens-search"
+path = "src/bin/index_tokens_search.rs"
+
+[[bin]]
+name = "compute-holder-counts"
+path = "src/bin/compute_holder_counts.rs"
+
 [dependencies]
 # Database - FoundationDB for distributed key-value storage
 foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_1"], optional = true }

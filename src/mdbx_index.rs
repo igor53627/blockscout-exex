@@ -1590,4 +1590,62 @@ impl IndexDatabase for MdbxIndex {
         // Return empty vec for now
         Ok(vec![])
     }
+
+    async fn get_all_tokens(&self, limit: usize, offset: usize) -> Result<Vec<(Address, u64)>> {
+        let tx = self.env.tx()?;
+
+        let holder_counts_db = match tx.inner.open_db(Some(tables::TOKEN_HOLDER_COUNTS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(vec![]), // Table doesn't exist yet
+        };
+
+        let mut cursor = tx.inner.cursor(&holder_counts_db)?;
+
+        // Collect all tokens with their holder counts
+        let mut tokens: Vec<(Address, u64)> = Vec::new();
+        for result in cursor.iter::<Vec<u8>, Vec<u8>>() {
+            let (key, value) = result?;
+            if key.len() == 20 && value.len() == 8 {
+                let addr = Address::from_slice(&key);
+                let count = i64::from_le_bytes(value[..8].try_into().unwrap_or([0u8; 8])) as u64;
+                tokens.push((addr, count));
+            }
+        }
+
+        // Sort by holder count descending
+        tokens.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Apply pagination
+        Ok(tokens.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn get_top_addresses(&self, limit: usize, offset: usize) -> Result<Vec<(Address, u64)>> {
+        let tx = self.env.tx()?;
+
+        let addr_counters_db = match tx.inner.open_db(Some(tables::ADDRESS_COUNTERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(vec![]), // Table doesn't exist yet
+        };
+
+        let mut cursor = tx.inner.cursor(&addr_counters_db)?;
+
+        // Collect all addresses with their tx counts (kind=0 means TX counter)
+        // Key format: address[20] + kind[1]
+        let mut addresses: Vec<(Address, u64)> = Vec::new();
+        for result in cursor.iter::<Vec<u8>, Vec<u8>>() {
+            let (key, value) = result?;
+            // We only want TX counters (kind = 0), key is 21 bytes: addr[20] + kind[1]
+            if key.len() == 21 && key[20] == 0 && value.len() == 8 {
+                let addr = Address::from_slice(&key[..20]);
+                let count = i64::from_le_bytes(value[..8].try_into().unwrap_or([0u8; 8])) as u64;
+                addresses.push((addr, count));
+            }
+        }
+
+        // Sort by tx count descending
+        addresses.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Apply pagination
+        Ok(addresses.into_iter().skip(offset).take(limit).collect())
+    }
 }

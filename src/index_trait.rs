@@ -198,6 +198,20 @@ pub trait IndexDatabase: Send + Sync {
     ///
     /// Returns (date_string, count) pairs for the last N days
     async fn get_daily_tx_metrics(&self, days: usize) -> Result<Vec<(String, u64)>>;
+
+    // ============================================================================
+    // List Operations - Enumeration
+    // ============================================================================
+
+    /// Get all tokens with their holder counts, sorted by holder count descending
+    ///
+    /// Returns (token_address, holder_count) pairs with pagination
+    async fn get_all_tokens(&self, limit: usize, offset: usize) -> Result<Vec<(Address, u64)>>;
+
+    /// Get top addresses by transaction count
+    ///
+    /// Returns (address, tx_count) pairs with pagination
+    async fn get_top_addresses(&self, limit: usize, offset: usize) -> Result<Vec<(Address, u64)>>;
 }
 
 #[cfg(test)]

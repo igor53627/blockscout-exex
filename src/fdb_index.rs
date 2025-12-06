@@ -1529,4 +1529,16 @@ impl IndexDatabase for FdbIndex {
     async fn get_daily_tx_metrics(&self, days: usize) -> Result<Vec<(String, u64)>> {
         self.get_daily_tx_metrics(days).await
     }
+
+    async fn get_all_tokens(&self, _limit: usize, _offset: usize) -> Result<Vec<(Address, u64)>> {
+        // FDB implementation - placeholder for now
+        // Would need to scan token holder counts key range
+        Ok(vec![])
+    }
+
+    async fn get_top_addresses(&self, _limit: usize, _offset: usize) -> Result<Vec<(Address, u64)>> {
+        // FDB implementation - placeholder for now
+        // Would need to scan address counters key range
+        Ok(vec![])
+    }
 }

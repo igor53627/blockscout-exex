@@ -19,6 +19,8 @@ pub struct TokenDocument {
     pub symbol: Option<String>,
     pub decimals: Option<u8>,
     pub token_type: String,
+    #[serde(default)]
+    pub holder_count: u64,
 }
 
 impl TokenDocument {
@@ -38,7 +40,13 @@ impl TokenDocument {
             symbol,
             decimals,
             token_type: token_type.to_string(),
+            holder_count: 0,
         }
+    }
+
+    pub fn with_holder_count(mut self, count: u64) -> Self {
+        self.holder_count = count;
+        self
     }
 }
 
@@ -103,7 +111,7 @@ impl SearchClient {
         let tokens_settings = Settings::new()
             .with_searchable_attributes(["name", "symbol", "address"])
             .with_filterable_attributes(["chain", "token_type"])
-            .with_sortable_attributes(["name"]);
+            .with_sortable_attributes(["name", "holder_count"]);
 
         let addresses_settings = Settings::new()
             .with_searchable_attributes(["address", "ens_name", "label"])
@@ -220,5 +228,39 @@ impl SearchClient {
 
     pub async fn search_quick(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         self.search(query, limit).await
+    }
+
+    /// List all tokens sorted by holder_count descending
+    pub async fn list_tokens(&self, limit: usize, offset: usize) -> Result<Vec<TokenDocument>> {
+        let chain_filter = format!("chain = \"{}\"", self.chain);
+
+        let results = self
+            .tokens_index()
+            .search()
+            .with_query("")  // Empty query = all documents
+            .with_filter(&chain_filter)
+            .with_sort(&["holder_count:desc"])
+            .with_limit(limit)
+            .with_offset(offset)
+            .execute::<TokenDocument>()
+            .await?;
+
+        Ok(results.hits.into_iter().map(|h| h.result).collect())
+    }
+
+    /// Get total token count for this chain
+    pub async fn get_token_count(&self) -> Result<u64> {
+        let chain_filter = format!("chain = \"{}\"", self.chain);
+
+        let results = self
+            .tokens_index()
+            .search()
+            .with_query("")
+            .with_filter(&chain_filter)
+            .with_limit(0)  // We only need the count
+            .execute::<TokenDocument>()
+            .await?;
+
+        Ok(results.estimated_total_hits.unwrap_or(0) as u64)
     }
 }

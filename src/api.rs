@@ -110,6 +110,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/v2/transactions/:hash/internal-transactions", get(tx_internal_txs))
         .route("/api/v2/transactions/:hash/state-changes", get(tx_state_changes))
         .route("/api/v2/transactions/:hash/raw-trace", get(tx_raw_trace))
+        .route("/api/v2/addresses", get(addresses_list))
         .route("/api/v2/addresses/:hash", get(address_by_hash))
         .route("/api/v2/addresses/:hash/counters", get(address_counters))
         .route("/api/v2/addresses/:hash/tabs-counters", get(address_tabs_counters))
@@ -1222,6 +1223,73 @@ fn flatten_call_trace(trace: &Value, output: &mut Vec<Value>, trace_address: Vec
     }
 }
 
+async fn addresses_list(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let addresses = state
+        .index
+        .get_top_addresses(params.limit + 1, params.offset)
+        .await
+        .unwrap_or_default();
+
+    let has_more = addresses.len() > params.limit;
+    let addresses: Vec<_> = addresses.into_iter().take(params.limit).collect();
+
+    // Build response items
+    let items: Vec<Value> = addresses
+        .iter()
+        .map(|(addr, tx_count)| {
+            let addr_str = format!("{:?}", addr);
+            json!({
+                "hash": addr_str,
+                "block_number_balance_updated_at": null,
+                "coin_balance": "0",
+                "creator_address_hash": null,
+                "creation_transaction_hash": null,
+                "ens_domain_name": null,
+                "exchange_rate": null,
+                "has_custom_methods_read": false,
+                "has_custom_methods_write": false,
+                "has_decompiled_code": false,
+                "has_logs": false,
+                "has_methods_read": false,
+                "has_methods_read_proxy": false,
+                "has_methods_write": false,
+                "has_methods_write_proxy": false,
+                "has_token_transfers": false,
+                "has_tokens": false,
+                "has_validated_blocks": false,
+                "implementations": [],
+                "is_contract": false,
+                "is_verified": false,
+                "name": null,
+                "private_tags": [],
+                "public_tags": [],
+                "token": null,
+                "tx_count": tx_count.to_string(),
+                "watchlist_address_id": null,
+                "watchlist_names": []
+            })
+        })
+        .collect();
+
+    let next_page_params = if has_more {
+        Some(json!({
+            "items_count": params.limit,
+            "fetched_coin_balance": "0",
+            "hash": addresses.last().map(|(a, _)| format!("{:?}", a)).unwrap_or_default()
+        }))
+    } else {
+        None
+    };
+
+    Json(json!({
+        "items": items,
+        "next_page_params": next_page_params
+    }))
+}
+
 async fn address_by_hash(
     State(state): State<Arc<ApiState>>,
     Path(hash): Path<String>,
@@ -1498,10 +1566,111 @@ async fn token_counters(
     }))
 }
 
-async fn tokens_list() -> impl IntoResponse {
+async fn tokens_list(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    // Try Meilisearch first (has cached metadata)
+    if let Some(ref search) = state.search {
+        if let Ok(tokens) = search.list_tokens(params.limit + 1, params.offset).await {
+            let has_more = tokens.len() > params.limit;
+            let tokens: Vec<_> = tokens.into_iter().take(params.limit).collect();
+
+            let items: Vec<Value> = tokens
+                .iter()
+                .map(|t| {
+                    json!({
+                        "address_hash": t.address,
+                        "circulating_market_cap": null,
+                        "decimals": t.decimals.map(|d| d.to_string()).unwrap_or_else(|| "18".to_string()),
+                        "exchange_rate": null,
+                        "holders_count": t.holder_count.to_string(),
+                        "icon_url": null,
+                        "name": t.name.clone().unwrap_or_else(|| "Unknown Token".to_string()),
+                        "reputation": "ok",
+                        "symbol": t.symbol.clone().unwrap_or_else(|| "???".to_string()),
+                        "total_supply": null,
+                        "type": t.token_type,
+                        "volume_24h": null
+                    })
+                })
+                .collect();
+
+            let next_page_params = if has_more {
+                Some(json!({
+                    "items_count": params.limit,
+                    "holder_count": tokens.last().map(|t| t.holder_count).unwrap_or(0),
+                    "fiat_value": null,
+                    "is_name_null": false,
+                    "name": null
+                }))
+            } else {
+                None
+            };
+
+            return Json(json!({
+                "items": items,
+                "next_page_params": next_page_params
+            }));
+        }
+    }
+
+    // Fallback: Use MDBX + RPC calls
+    let tokens = state
+        .index
+        .get_all_tokens(params.limit + 1, params.offset)
+        .await
+        .unwrap_or_default();
+
+    let has_more = tokens.len() > params.limit;
+    let tokens: Vec<_> = tokens.into_iter().take(params.limit).collect();
+
+    // Fetch metadata for each token via RPC
+    let items: Vec<Value> = futures::future::join_all(
+        tokens.iter().map(|(token_addr, holder_count)| {
+            let rpc_url = state.rpc_url.clone();
+            let addr = format!("{:?}", token_addr);
+            let count = *holder_count;
+            async move {
+                let (name, symbol, decimals) = if let Some(ref url) = rpc_url {
+                    fetch_token_metadata(url, &addr).await
+                } else {
+                    (None, None, None)
+                };
+
+                json!({
+                    "address_hash": addr,
+                    "circulating_market_cap": null,
+                    "decimals": decimals.unwrap_or_else(|| "18".to_string()),
+                    "exchange_rate": null,
+                    "holders_count": count.to_string(),
+                    "icon_url": null,
+                    "name": name.unwrap_or_else(|| "Unknown Token".to_string()),
+                    "reputation": "ok",
+                    "symbol": symbol.unwrap_or_else(|| "???".to_string()),
+                    "total_supply": null,
+                    "type": "ERC-20",
+                    "volume_24h": null
+                })
+            }
+        })
+    ).await;
+
+    let next_page_params = if has_more {
+        Some(json!({
+            "items_count": params.limit,
+            "holder_count": tokens.last().map(|(_, c)| c).unwrap_or(&0),
+            "fiat_value": null,
+            "is_name_null": false,
+            "name": null
+        }))
+    } else {
+        None
+    };
+
     Json(json!({
-        "items": [],
-        "next_page_params": null
+        "items": items,
+        "next_page_params": next_page_params
     }))
 }
 
