@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
+use crate::cache::LruCache;
 use crate::index_trait::IndexDatabase;
 pub use crate::meili::SearchClient;
 #[cfg(feature = "reth")]
@@ -56,6 +57,9 @@ pub struct ApiState {
     // Price caches (TTL: 30 seconds)
     pub gas_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
     pub coin_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
+    // LRU caches for blocks and transactions (256MB each)
+    pub block_cache: Arc<LruCache<String, Value>>,
+    pub tx_cache: Arc<LruCache<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,19 +270,29 @@ async fn block_by_id(
     State(state): State<Arc<ApiState>>,
     Path(height_or_hash): Path<String>,
 ) -> impl IntoResponse {
+    // Check cache first
+    let cache_key = format!("block:{}", height_or_hash);
+    if let Some(cached) = state.block_cache.get(&cache_key) {
+        return Json(cached);
+    }
+
     #[cfg(feature = "reth")]
     if let Some(ref reth) = state.reth {
         // Try as block number first
         if let Ok(height) = height_or_hash.parse::<u64>() {
             if let Ok(Some(block)) = reth.block_by_number(height) {
-                return Json(block_to_json(&block, height));
+                let json = block_to_json(&block, height);
+                state.block_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
         // Try as hash
         if let Ok(hash) = height_or_hash.parse::<B256>() {
             if let Ok(Some(block)) = reth.block_by_hash(hash) {
                 let height = block.header().number;
-                return Json(block_to_json(&block, height));
+                let json = block_to_json(&block, height);
+                state.block_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
     }
@@ -417,6 +431,12 @@ async fn transaction_by_hash(
     State(state): State<Arc<ApiState>>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    // Check cache first
+    let cache_key = format!("tx:{}", hash);
+    if let Some(cached) = state.tx_cache.get(&cache_key) {
+        return Json(cached);
+    }
+
     // Try RPC first
     if let Some(ref rpc_url) = state.rpc_url {
         if let Ok(tx) = fetch_tx_rpc(rpc_url, &hash).await {
@@ -446,7 +466,9 @@ async fn transaction_by_hash(
                 } else {
                     chrono::Utc::now().to_rfc3339()
                 };
-                return Json(rpc_tx_to_json(&tx, block_num.unwrap_or(0), &timestamp, base_fee, receipt.as_ref().filter(|r| !r.is_null())));
+                let json = rpc_tx_to_json(&tx, block_num.unwrap_or(0), &timestamp, base_fee, receipt.as_ref().filter(|r| !r.is_null()));
+                state.tx_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
     }
@@ -457,7 +479,9 @@ async fn transaction_by_hash(
             if let Ok(Some(tx)) = reth.transaction_by_hash(tx_hash) {
                 let block_num = reth.transaction_block_number(tx_hash).ok().flatten();
                 let receipt = reth.receipt_by_hash(tx_hash).ok().flatten();
-                return Json(tx_to_json(&tx, block_num, receipt.as_ref()));
+                let json = tx_to_json(&tx, block_num, receipt.as_ref());
+                state.tx_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
     }

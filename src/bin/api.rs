@@ -8,6 +8,7 @@ use eyre::Result;
 use serde_json::json;
 
 use blockscout_exex::api::{create_router, ApiState};
+use blockscout_exex::cache::new_json_cache;
 #[cfg(feature = "fdb")]
 use blockscout_exex::fdb_index::FdbIndex;
 use blockscout_exex::IndexDatabase;
@@ -164,6 +165,11 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Initialize LRU caches for blocks and transactions (256MB each)
+    let block_cache = Arc::new(new_json_cache(256 * 1024 * 1024));
+    let tx_cache = Arc::new(new_json_cache(256 * 1024 * 1024));
+    tracing::info!("Initialized block and transaction caches (256MB each)");
+
     let state = Arc::new(ApiState {
         index,
         #[cfg(feature = "reth")]
@@ -175,6 +181,8 @@ async fn main() -> Result<()> {
         chain: args.chain.clone(),
         gas_price_cache: Arc::new(parking_lot::RwLock::new(None)),
         coin_price_cache: Arc::new(parking_lot::RwLock::new(None)),
+        block_cache,
+        tx_cache,
     });
     let router = create_router(state);
 
