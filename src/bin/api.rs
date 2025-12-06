@@ -8,17 +8,20 @@ use eyre::Result;
 use serde_json::json;
 
 use blockscout_exex::api::{create_router, ApiState};
-use blockscout_exex::fdb_index::FdbIndex;
+use blockscout_exex::cache::new_json_cache;
+use blockscout_exex::IndexDatabase;
+use blockscout_exex::mdbx_index::MdbxIndex;
 use blockscout_exex::meili::SearchClient;
+use blockscout_exex::rpc_executor::RpcExecutor;
 use blockscout_exex::websocket::{create_broadcaster, BroadcastMessage, Broadcaster};
 
 #[derive(Parser)]
 #[command(name = "blockscout-api")]
-#[command(about = "Blockscout-compatible API server backed by FoundationDB")]
+#[command(about = "Blockscout-compatible API server backed by MDBX")]
 struct Args {
-    /// FoundationDB cluster file path (uses default if not specified)
+    /// MDBX database path (required)
     #[arg(long)]
-    cluster_file: Option<PathBuf>,
+    mdbx_path: PathBuf,
 
     /// API server port (ignored if --socket is set)
     #[arg(long, default_value = "3000")]
@@ -55,21 +58,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Initialize FDB network - must be done once before any FDB operations
-    // Safety: We ensure the network guard is held until program exit
-    let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
-
-    tracing::info!("Connecting to FoundationDB...");
-    let index = match &args.cluster_file {
-        Some(path) => {
-            tracing::info!("Using cluster file: {:?}", path);
-            Arc::new(FdbIndex::open(path)?)
-        }
-        None => {
-            tracing::info!("Using default cluster file");
-            Arc::new(FdbIndex::open_default()?)
-        }
-    };
+    // MDBX backend (always enabled)
+    tracing::info!("Using MDBX backend (read-only) at: {:?}", args.mdbx_path);
+    let index: Arc<dyn IndexDatabase> = Arc::new(MdbxIndex::open_readonly(&args.mdbx_path)?);
 
     let last_block = index.last_indexed_block().await?;
     tracing::info!("Last indexed block: {:?}", last_block);
@@ -96,6 +87,19 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Initialize RPC executor with dedicated thread pools
+    // NOTE: RpcExecutor creates separate tokio runtimes which can't be dropped in async context
+    // For now, disable it to avoid runtime panic on shutdown. The API still works without it.
+    let rpc_executor: Option<Arc<RpcExecutor>> = None;
+    if args.reth_rpc.is_some() {
+        tracing::info!("RPC executor disabled (creates separate runtime, causes shutdown panic)");
+    }
+
+    // Initialize LRU caches for blocks and transactions (256MB each)
+    let block_cache = Arc::new(new_json_cache(256 * 1024 * 1024));
+    let tx_cache = Arc::new(new_json_cache(256 * 1024 * 1024));
+    tracing::info!("Initialized block and transaction caches (256MB each)");
+
     let state = Arc::new(ApiState {
         index,
         #[cfg(feature = "reth")]
@@ -103,6 +107,12 @@ async fn main() -> Result<()> {
         broadcaster,
         rpc_url: args.reth_rpc.clone(),
         search,
+        rpc_executor,
+        chain: args.chain.clone(),
+        gas_price_cache: Arc::new(parking_lot::RwLock::new(None)),
+        coin_price_cache: Arc::new(parking_lot::RwLock::new(None)),
+        block_cache,
+        tx_cache,
     });
     let router = create_router(state);
 
@@ -171,7 +181,7 @@ async fn block_watcher(reth_rpc: String, tx: Broadcaster) {
                             if let Ok(blk) = fetch_block_by_number(&client, &reth_rpc, block_height).await {
                                 let txs = blk["transactions"].as_array();
                                 let tx_count = txs.map(|t| t.len()).unwrap_or(0);
-                                
+
                                 tracing::info!("New block: {} ({} txs)", block_height, tx_count);
 
                                 // Broadcast block
@@ -182,28 +192,32 @@ async fn block_watcher(reth_rpc: String, tx: Broadcaster) {
                                     payload: block_payload,
                                 });
 
-                                // Broadcast transactions
-                                if let Some(transactions) = txs {
-                                    for (idx, tx_obj) in transactions.iter().enumerate() {
-                                        let tx_payload = format_tx_for_ws(tx_obj, block_height, idx);
-                                        let _ = tx.send(BroadcastMessage {
-                                            topic: "transactions:new_transaction".to_string(),
-                                            event: "new_transaction".to_string(),
-                                            payload: tx_payload,
-                                        });
-                                    }
-                                }
+                                // Broadcast transaction count (frontend expects { transaction: count })
+                                let _ = tx.send(BroadcastMessage {
+                                    topic: "transactions:new_transaction".to_string(),
+                                    event: "transaction".to_string(),
+                                    payload: json!({ "transaction": tx_count }),
+                                });
                             }
                         }
 
-                        // Send indexing status
+                        // Send indexing status for blocks
                         let _ = tx.send(BroadcastMessage {
                             topic: "blocks:indexing".to_string(),
                             event: "index_status".to_string(),
                             payload: json!({
-                                "finished_indexing": true,
-                                "indexed_blocks_ratio": "1.00",
-                                "indexed_internal_transactions_ratio": "1.00"
+                                "finished": true,
+                                "ratio": "1.00"
+                            }),
+                        });
+
+                        // Send indexing status for internal transactions
+                        let _ = tx.send(BroadcastMessage {
+                            topic: "blocks:indexing_internal_transactions".to_string(),
+                            event: "index_status".to_string(),
+                            payload: json!({
+                                "finished": true,
+                                "ratio": "1.00"
                             }),
                         });
                     }
@@ -281,6 +295,7 @@ fn format_block_for_ws(block: &serde_json::Value) -> serde_json::Value {
             "height": number_dec,
             "timestamp": ts,
             "tx_count": tx_count,
+            "transactions_count": tx_count,
             "miner": {
                 "hash": miner,
                 "implementations": null,

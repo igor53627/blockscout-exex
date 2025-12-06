@@ -6,10 +6,6 @@ license = "MIT"
 description = "Blockscout-compatible indexer as a Reth ExEx sidecar"
 
 [[bin]]
-name = "blockscout-exex"
-path = "src/main.rs"
-
-[[bin]]
 name = "blockscout-backfill"
 path = "src/bin/backfill.rs"
 
@@ -21,13 +17,23 @@ path = "src/bin/api.rs"
 name = "blockscout-subscriber"
 path = "src/bin/subscriber.rs"
 
-[dependencies]
-# Database - FoundationDB for distributed key-value storage
-foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_1"] }
+[[bin]]
+name = "update-counters"
+path = "src/bin/update_counters.rs"
 
+[[bin]]
+name = "index-tokens-search"
+path = "src/bin/index_tokens_search.rs"
+
+[[bin]]
+name = "compute-holder-counts"
+path = "src/bin/compute_holder_counts.rs"
+
+[dependencies]
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+async-trait = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -61,18 +67,44 @@ tokio-tungstenite = "0.26"
 # Search
 meilisearch-sdk = "0.27"
 
-# For reading reth DB directly
+# Probabilistic data structures
+hyperloglogplus = "0.4"
+ahash = { version = "0.8", features = ["serde"] }
+
+# Caching
+dashmap = "5.5"
+parking_lot = "0.12"
+
+# Lock-free data structures for buffer pooling
+crossbeam-queue = "0.3"
+
+# For reading reth DB directly and MDBX support
 reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-libmdbx = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-exex = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 chrono = "0.4.42"
 
 [features]
-default = []
-reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
+default = ["mdbx"]
+mdbx = ["reth"]
+reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-db-api", "reth-libmdbx", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
+exex = ["mdbx", "reth", "reth-exex", "reth-execution-types", "reth-node-api", "reth-tracing", "reth-primitives-traits"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "mdbx_bench"
+harness = false

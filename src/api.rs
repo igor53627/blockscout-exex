@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, U256 as AlloyU256};
 #[cfg(feature = "reth")]
@@ -10,23 +11,55 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
-use crate::fdb_index::FdbIndex;
+use crate::cache::LruCache;
+use crate::index_trait::IndexDatabase;
 pub use crate::meili::SearchClient;
 #[cfg(feature = "reth")]
 use crate::reth_reader::RethReader;
+use crate::rpc_executor::RpcExecutor;
 use crate::websocket::{websocket_handler, Broadcaster};
 
+// Cache entry with timestamp
+#[derive(Clone, Debug)]
+pub struct CachedValue<T> {
+    value: T,
+    timestamp: Instant,
+}
+
+impl<T> CachedValue<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value,
+            timestamp: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self, ttl: Duration) -> bool {
+        self.timestamp.elapsed() > ttl
+    }
+}
+
 pub struct ApiState {
-    pub index: Arc<FdbIndex>,
+    pub index: Arc<dyn IndexDatabase>,
     #[cfg(feature = "reth")]
     pub reth: Option<RethReader>,
     pub broadcaster: Broadcaster,
     pub rpc_url: Option<String>,
     pub search: Option<SearchClient>,
+    pub rpc_executor: Option<Arc<RpcExecutor>>,
+    /// Chain name for oracle selection (e.g., "sepolia", "mainnet")
+    pub chain: String,
+    // Price caches (TTL: 30 seconds)
+    pub gas_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
+    pub coin_price_cache: Arc<RwLock<Option<CachedValue<String>>>>,
+    // LRU caches for blocks and transactions (256MB each)
+    pub block_cache: Arc<LruCache<String, Value>>,
+    pub tx_cache: Arc<LruCache<String, Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +114,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/v2/transactions/:hash/internal-transactions", get(tx_internal_txs))
         .route("/api/v2/transactions/:hash/state-changes", get(tx_state_changes))
         .route("/api/v2/transactions/:hash/raw-trace", get(tx_raw_trace))
+        .route("/api/v2/addresses", get(addresses_list))
         .route("/api/v2/addresses/:hash", get(address_by_hash))
         .route("/api/v2/addresses/:hash/counters", get(address_counters))
         .route("/api/v2/addresses/:hash/tabs-counters", get(address_tabs_counters))
@@ -92,6 +126,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/api/v2/main-page/transactions", get(homepage_txs))
         .route("/api/v2/search", get(search))
         .route("/api/v2/search/quick", get(search_quick))
+        .route("/api/v2/health", get(health_check))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -100,34 +135,64 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
 
 async fn backend_version() -> impl IntoResponse {
     Json(json!({
-        "backend_version": "6.10.0-exex-fdb"
+        "backend_version": "6.10.0-exex-mdbx"
     }))
 }
 
 async fn stats(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    // Try reth reader first, fallback to index.last_indexed_block()
     #[cfg(feature = "reth")]
-    let last_block = state
-        .reth
-        .as_ref()
-        .and_then(|r| r.last_block_number().ok().flatten())
-        .unwrap_or(0);
+    let last_block = {
+        let from_reth = state
+            .reth
+            .as_ref()
+            .and_then(|r| r.last_block_number().ok().flatten());
+        match from_reth {
+            Some(b) => b,
+            None => tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.index.last_indexed_block()
+            ).await.unwrap_or(Ok(None)).unwrap_or(None).unwrap_or(0),
+        }
+    };
     #[cfg(not(feature = "reth"))]
-    let last_block = state.index.last_indexed_block().await.unwrap_or(None).unwrap_or(0);
+    let last_block = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.last_indexed_block()
+    ).await.unwrap_or(Ok(None)).unwrap_or(None).unwrap_or(0);
 
-    let total_txs = state.index.get_total_txs().await.unwrap_or(0);
-    let total_transfers = state.index.get_total_transfers().await.unwrap_or(0);
+    // Use timeout to prevent blocking if database is slow
+    let total_txs = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.get_total_txs()
+    ).await.unwrap_or(Ok(0)).unwrap_or(0);
+
+    let total_transfers = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.get_total_transfers()
+    ).await.unwrap_or(Ok(0)).unwrap_or(0);
+
+    // Use total addresses count
+    let total_addresses = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.index.get_total_addresses()
+    ).await.unwrap_or(Ok(0)).unwrap_or(0);
+
+    // Fetch gas price and coin price if RPC is available
+    let gas_prices = get_gas_price(&state).await;
+    let coin_price = get_coin_price(&state).await;
 
     Json(json!({
         "total_blocks": last_block.to_string(),
-        "total_addresses": "0",
+        "total_addresses": total_addresses.to_string(),
         "total_transactions": total_txs.to_string(),
         "average_block_time": 12000.0,
-        "coin_price": null,
+        "coin_price": coin_price,
         "coin_price_change_percentage": null,
         "total_gas_used": "0",
         "transactions_today": null,
         "gas_used_today": "0",
-        "gas_prices": null,
+        "gas_prices": gas_prices,
         "gas_price_updated_at": null,
         "gas_prices_update_in": 0,
         "static_gas_price": null,
@@ -195,7 +260,7 @@ async fn blocks(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         }
     }
 
-    // Fallback to FDB index
+    // Fallback to index
     let last_block = state.index.last_indexed_block().await.unwrap_or(None).unwrap_or(0);
     let items: Vec<Value> = (0..10)
         .filter_map(|i| {
@@ -214,19 +279,29 @@ async fn block_by_id(
     State(state): State<Arc<ApiState>>,
     Path(height_or_hash): Path<String>,
 ) -> impl IntoResponse {
+    // Check cache first
+    let cache_key = format!("block:{}", height_or_hash);
+    if let Some(cached) = state.block_cache.get(&cache_key) {
+        return Json(cached);
+    }
+
     #[cfg(feature = "reth")]
     if let Some(ref reth) = state.reth {
         // Try as block number first
         if let Ok(height) = height_or_hash.parse::<u64>() {
             if let Ok(Some(block)) = reth.block_by_number(height) {
-                return Json(block_to_json(&block, height));
+                let json = block_to_json(&block, height);
+                state.block_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
         // Try as hash
         if let Ok(hash) = height_or_hash.parse::<B256>() {
             if let Ok(Some(block)) = reth.block_by_hash(hash) {
                 let height = block.header().number;
-                return Json(block_to_json(&block, height));
+                let json = block_to_json(&block, height);
+                state.block_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
     }
@@ -365,6 +440,12 @@ async fn transaction_by_hash(
     State(state): State<Arc<ApiState>>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    // Check cache first
+    let cache_key = format!("tx:{}", hash);
+    if let Some(cached) = state.tx_cache.get(&cache_key) {
+        return Json(cached);
+    }
+
     // Try RPC first
     if let Some(ref rpc_url) = state.rpc_url {
         if let Ok(tx) = fetch_tx_rpc(rpc_url, &hash).await {
@@ -394,7 +475,9 @@ async fn transaction_by_hash(
                 } else {
                     chrono::Utc::now().to_rfc3339()
                 };
-                return Json(rpc_tx_to_json(&tx, block_num.unwrap_or(0), &timestamp, base_fee, receipt.as_ref().filter(|r| !r.is_null())));
+                let json = rpc_tx_to_json(&tx, block_num.unwrap_or(0), &timestamp, base_fee, receipt.as_ref().filter(|r| !r.is_null()));
+                state.tx_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
     }
@@ -405,7 +488,9 @@ async fn transaction_by_hash(
             if let Ok(Some(tx)) = reth.transaction_by_hash(tx_hash) {
                 let block_num = reth.transaction_block_number(tx_hash).ok().flatten();
                 let receipt = reth.receipt_by_hash(tx_hash).ok().flatten();
-                return Json(tx_to_json(&tx, block_num, receipt.as_ref()));
+                let json = tx_to_json(&tx, block_num, receipt.as_ref());
+                state.tx_cache.insert(cache_key, json.clone());
+                return Json(json);
             }
         }
     }
@@ -915,7 +1000,7 @@ async fn tx_state_changes(
             }
             
             // Try to get state diff using debug_traceTransaction
-            let trace_result = trace_tx_state_diff(rpc_url, &hash).await;
+            let trace_result = trace_tx_state_diff(&state, &hash).await;
             
             if let Ok(state_diff) = trace_result {
                 let items = parse_state_diff(&state_diff, &tx);
@@ -1004,22 +1089,12 @@ async fn tx_state_changes(
 }
 
 // Helper to trace transaction state diff
-async fn trace_tx_state_diff(rpc_url: &str, tx_hash: &str) -> Result<Value, ()> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "debug_traceTransaction",
-            "params": [tx_hash, {"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}],
-            "id": 1
-        }))
-        .send()
+async fn trace_tx_state_diff(state: &ApiState, tx_hash: &str) -> Result<Value, ()> {
+    let params = json!([tx_hash, {"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}]);
+
+    execute_rpc_call(state, "debug_traceTransaction", params)
         .await
-        .map_err(|_| ())?;
-    
-    let body: Value = resp.json().await.map_err(|_| ())?;
-    Ok(body["result"].clone())
+        .map_err(|_| ())
 }
 
 // Parse state diff into Blockscout format
@@ -1181,6 +1256,73 @@ fn flatten_call_trace(trace: &Value, output: &mut Vec<Value>, trace_address: Vec
     }
 }
 
+async fn addresses_list(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let addresses = state
+        .index
+        .get_top_addresses(params.limit + 1, params.offset)
+        .await
+        .unwrap_or_default();
+
+    let has_more = addresses.len() > params.limit;
+    let addresses: Vec<_> = addresses.into_iter().take(params.limit).collect();
+
+    // Build response items
+    let items: Vec<Value> = addresses
+        .iter()
+        .map(|(addr, tx_count)| {
+            let addr_str = format!("{:?}", addr);
+            json!({
+                "hash": addr_str,
+                "block_number_balance_updated_at": null,
+                "coin_balance": "0",
+                "creator_address_hash": null,
+                "creation_transaction_hash": null,
+                "ens_domain_name": null,
+                "exchange_rate": null,
+                "has_custom_methods_read": false,
+                "has_custom_methods_write": false,
+                "has_decompiled_code": false,
+                "has_logs": false,
+                "has_methods_read": false,
+                "has_methods_read_proxy": false,
+                "has_methods_write": false,
+                "has_methods_write_proxy": false,
+                "has_token_transfers": false,
+                "has_tokens": false,
+                "has_validated_blocks": false,
+                "implementations": [],
+                "is_contract": false,
+                "is_verified": false,
+                "name": null,
+                "private_tags": [],
+                "public_tags": [],
+                "token": null,
+                "tx_count": tx_count.to_string(),
+                "watchlist_address_id": null,
+                "watchlist_names": []
+            })
+        })
+        .collect();
+
+    let next_page_params = if has_more {
+        Some(json!({
+            "items_count": params.limit,
+            "fetched_coin_balance": "0",
+            "hash": addresses.last().map(|(a, _)| format!("{:?}", a)).unwrap_or_default()
+        }))
+    } else {
+        None
+    };
+
+    Json(json!({
+        "items": items,
+        "next_page_params": next_page_params
+    }))
+}
+
 async fn address_by_hash(
     State(state): State<Arc<ApiState>>,
     Path(hash): Path<String>,
@@ -1233,7 +1375,7 @@ async fn address_counters(
     
     // Use atomic counters from FDB (O(1) lookup instead of range scan)
     let tx_count = state.index.get_address_tx_count(&addr).await.unwrap_or(0);
-    let transfer_count = state.index.get_address_token_transfer_count(&addr).await.unwrap_or(0);
+    let transfer_count = state.index.get_address_transfer_count(&addr).await.unwrap_or(0);
     
     Json(json!({
         "transactions_count": tx_count.to_string(),
@@ -1263,7 +1405,7 @@ async fn address_tabs_counters(
     
     // Use atomic counters from FDB (O(1) lookup instead of range scan)
     let tx_count = state.index.get_address_tx_count(&addr).await.unwrap_or(0);
-    let transfer_count = state.index.get_address_token_transfer_count(&addr).await.unwrap_or(0);
+    let transfer_count = state.index.get_address_transfer_count(&addr).await.unwrap_or(0);
     
     Json(json!({
         "internal_transactions_count": 0,
@@ -1290,15 +1432,9 @@ async fn token_by_hash(
         // Fetch total supply
         let total_supply = fetch_token_total_supply(rpc_url, &hash).await;
         
-        // Try atomic holder count first, fall back to range scan
+        // Get atomic holder count
         let holders_count = if let Ok(addr) = hash.parse::<Address>() {
-            let count = state.index.get_token_holder_count(&addr).await.unwrap_or(0);
-            if count > 0 {
-                count as usize
-            } else {
-                // Fallback to range scan for data indexed before Phase 4
-                state.index.count_token_holders(&addr, MAX_COUNT_CAP).await.unwrap_or(0)
-            }
+            state.index.get_token_holder_count(&addr).await.unwrap_or(0) as usize
         } else {
             0
         };
@@ -1449,9 +1585,10 @@ async fn token_counters(
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
     let (holders_count, transfers_count) = if let Ok(addr) = hash.parse::<Address>() {
-        let holders = state.index.count_token_holders(&addr, MAX_COUNT_CAP).await.unwrap_or(0);
-        let transfers = state.index.count_token_transfers(&addr, MAX_COUNT_CAP).await.unwrap_or(0);
-        (holders, transfers)
+        let holders = state.index.get_token_holder_count(&addr).await.unwrap_or(0) as usize;
+        // Note: transfers count would require scanning or a new counter
+        // For now, return 0 as this is a stub endpoint
+        (holders, 0)
     } else {
         (0, 0)
     };
@@ -1462,10 +1599,111 @@ async fn token_counters(
     }))
 }
 
-async fn tokens_list() -> impl IntoResponse {
+async fn tokens_list(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<PaginationParams>,
+) -> impl IntoResponse {
+    // Try Meilisearch first (has cached metadata)
+    if let Some(ref search) = state.search {
+        if let Ok(tokens) = search.list_tokens(params.limit + 1, params.offset).await {
+            let has_more = tokens.len() > params.limit;
+            let tokens: Vec<_> = tokens.into_iter().take(params.limit).collect();
+
+            let items: Vec<Value> = tokens
+                .iter()
+                .map(|t| {
+                    json!({
+                        "address_hash": t.address,
+                        "circulating_market_cap": null,
+                        "decimals": t.decimals.map(|d| d.to_string()).unwrap_or_else(|| "18".to_string()),
+                        "exchange_rate": null,
+                        "holders_count": t.holder_count.to_string(),
+                        "icon_url": null,
+                        "name": t.name.clone().unwrap_or_else(|| "Unknown Token".to_string()),
+                        "reputation": "ok",
+                        "symbol": t.symbol.clone().unwrap_or_else(|| "???".to_string()),
+                        "total_supply": null,
+                        "type": t.token_type,
+                        "volume_24h": null
+                    })
+                })
+                .collect();
+
+            let next_page_params = if has_more {
+                Some(json!({
+                    "items_count": params.limit,
+                    "holder_count": tokens.last().map(|t| t.holder_count).unwrap_or(0),
+                    "fiat_value": null,
+                    "is_name_null": false,
+                    "name": null
+                }))
+            } else {
+                None
+            };
+
+            return Json(json!({
+                "items": items,
+                "next_page_params": next_page_params
+            }));
+        }
+    }
+
+    // Fallback: Use MDBX + RPC calls
+    let tokens = state
+        .index
+        .get_all_tokens(params.limit + 1, params.offset)
+        .await
+        .unwrap_or_default();
+
+    let has_more = tokens.len() > params.limit;
+    let tokens: Vec<_> = tokens.into_iter().take(params.limit).collect();
+
+    // Fetch metadata for each token via RPC
+    let items: Vec<Value> = futures::future::join_all(
+        tokens.iter().map(|(token_addr, holder_count)| {
+            let rpc_url = state.rpc_url.clone();
+            let addr = format!("{:?}", token_addr);
+            let count = *holder_count;
+            async move {
+                let (name, symbol, decimals) = if let Some(ref url) = rpc_url {
+                    fetch_token_metadata(url, &addr).await
+                } else {
+                    (None, None, None)
+                };
+
+                json!({
+                    "address_hash": addr,
+                    "circulating_market_cap": null,
+                    "decimals": decimals.unwrap_or_else(|| "18".to_string()),
+                    "exchange_rate": null,
+                    "holders_count": count.to_string(),
+                    "icon_url": null,
+                    "name": name.unwrap_or_else(|| "Unknown Token".to_string()),
+                    "reputation": "ok",
+                    "symbol": symbol.unwrap_or_else(|| "???".to_string()),
+                    "total_supply": null,
+                    "type": "ERC-20",
+                    "volume_24h": null
+                })
+            }
+        })
+    ).await;
+
+    let next_page_params = if has_more {
+        Some(json!({
+            "items_count": params.limit,
+            "holder_count": tokens.last().map(|(_, c)| c).unwrap_or(&0),
+            "fiat_value": null,
+            "is_name_null": false,
+            "name": null
+        }))
+    } else {
+        None
+    };
+
     Json(json!({
-        "items": [],
-        "next_page_params": null
+        "items": items,
+        "next_page_params": next_page_params
     }))
 }
 
@@ -1828,6 +2066,239 @@ async fn fetch_block_receipts_rpc(rpc_url: &str, block_param: &str) -> Result<Va
         .json::<Value>()
         .await?;
     Ok(resp["result"].clone())
+}
+
+/// Execute RPC call using the executor if available, otherwise fall back to direct reqwest
+async fn execute_rpc_call(
+    state: &ApiState,
+    method: &str,
+    params: Value,
+) -> Result<Value, eyre::Report> {
+    let rpc_url = state.rpc_url.as_ref().ok_or_else(|| eyre::eyre!("RPC URL not configured"))?;
+
+    // Try using the executor if available
+    if let Some(ref executor) = state.rpc_executor {
+        use crate::rpc_executor::RpcRequest;
+
+        let request = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+            id: 1,
+        };
+
+        let response = executor.execute(rpc_url, request).await?;
+
+        if let Some(error) = response.error {
+            return Err(eyre::eyre!("RPC error: {}", error));
+        }
+
+        response.result.ok_or_else(|| eyre::eyre!("No result in RPC response"))
+    } else {
+        // Fallback to direct reqwest call
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": 1
+            }))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        if let Some(error) = resp.get("error") {
+            return Err(eyre::eyre!("RPC error: {}", error));
+        }
+
+        resp.get("result")
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("No result in RPC response"))
+    }
+}
+
+/// Fetch current gas price from RPC (eth_gasPrice)
+async fn fetch_gas_price_rpc(rpc_url: &str) -> Result<String, eyre::Report> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "eth_gasPrice",
+            "params": [],
+            "id": 1
+        }))
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+
+    if let Some(error) = resp.get("error") {
+        return Err(eyre::eyre!("RPC error: {}", error));
+    }
+
+    let gas_price_hex = resp["result"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("Invalid gas price response"))?;
+
+    // Convert hex to decimal string (in wei)
+    let gas_price_wei = hex_to_u256(gas_price_hex);
+    Ok(gas_price_wei)
+}
+
+/// Fetch ETH/USD price from Chainlink oracle via eth_call
+/// Sepolia: 0x694AA1769357215DE4FAC081bf1f309aDC325306
+/// Mainnet: 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419
+async fn fetch_chainlink_price_rpc(rpc_url: &str, oracle_address: &str) -> Result<String, eyre::Report> {
+    let client = reqwest::Client::new();
+
+    // latestRoundData() function selector: 0xfeaf968c
+    let selector = "0xfeaf968c";
+
+    let resp = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": oracle_address,
+                    "data": selector
+                },
+                "latest"
+            ],
+            "id": 1
+        }))
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+
+    if let Some(error) = resp.get("error") {
+        return Err(eyre::eyre!("RPC error: {}", error));
+    }
+
+    let result_hex = resp["result"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("Invalid Chainlink response"))?;
+
+    // Parse the result: latestRoundData returns (roundId, answer, startedAt, updatedAt, answeredInRound)
+    // Each value is 32 bytes (64 hex chars)
+    // We need the 2nd value (answer) which starts at byte 32 (char 64)
+    let result = result_hex.trim_start_matches("0x");
+    if result.len() < 128 {
+        return Err(eyre::eyre!("Invalid Chainlink response length"));
+    }
+
+    // Extract answer (2nd 32-byte value)
+    let answer_hex = &result[64..128];
+    let answer_raw = i128::from_str_radix(answer_hex, 16)
+        .map_err(|_| eyre::eyre!("Failed to parse Chainlink answer"))?;
+
+    // Chainlink price feeds return values with 8 decimals
+    // Convert to USD with 2 decimal places
+    let price_usd = (answer_raw as f64) / 100_000_000.0;
+
+    Ok(format!("{:.2}", price_usd))
+}
+
+/// Convert wei string to Gwei float
+fn wei_to_gwei(wei_str: &str) -> f64 {
+    let wei: u128 = wei_str.parse().unwrap_or(0);
+    wei as f64 / 1_000_000_000.0
+}
+
+/// Create GasPriceInfo JSON object in Blockscout format
+fn gas_price_info_json(gwei: f64) -> Value {
+    let info = json!({
+        "price": gwei,
+        "fiat_price": null,
+        "time": null,
+        "base_fee": null,
+        "priority_fee": null
+    });
+    json!({
+        "average": info.clone(),
+        "fast": info.clone(),
+        "slow": info
+    })
+}
+
+/// Get cached gas price or fetch from RPC
+async fn get_gas_price(state: &ApiState) -> Option<Value> {
+    let rpc_url = state.rpc_url.as_ref()?;
+
+    // Check cache first
+    let cache_ttl = Duration::from_secs(30);
+    {
+        let cache = state.gas_price_cache.read();
+        if let Some(cached) = cache.as_ref() {
+            if !cached.is_expired(cache_ttl) {
+                let gwei = wei_to_gwei(&cached.value);
+                return Some(gas_price_info_json(gwei));
+            }
+        }
+    }
+
+    // Fetch from RPC
+    match fetch_gas_price_rpc(rpc_url).await {
+        Ok(gas_price_wei) => {
+            // Update cache (store wei)
+            {
+                let mut cache = state.gas_price_cache.write();
+                *cache = Some(CachedValue::new(gas_price_wei.clone()));
+            }
+            // Return as Gwei
+            let gwei = wei_to_gwei(&gas_price_wei);
+            Some(gas_price_info_json(gwei))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch gas price: {}", e);
+            None
+        }
+    }
+}
+
+/// Get cached ETH price or fetch from Chainlink oracle
+async fn get_coin_price(state: &ApiState) -> Option<String> {
+    let rpc_url = state.rpc_url.as_ref()?;
+
+    // Check cache first
+    let cache_ttl = Duration::from_secs(30);
+    {
+        let cache = state.coin_price_cache.read();
+        if let Some(cached) = cache.as_ref() {
+            if !cached.is_expired(cache_ttl) {
+                return Some(cached.value.clone());
+            }
+        }
+    }
+
+    // Determine oracle address based on chain
+    let oracle_address = if state.chain.to_lowercase().contains("sepolia") {
+        "0x694AA1769357215DE4FAC081bf1f309aDC325306" // Sepolia
+    } else {
+        "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419" // Mainnet
+    };
+
+    // Fetch from Chainlink
+    match fetch_chainlink_price_rpc(rpc_url, oracle_address).await {
+        Ok(price) => {
+            // Update cache
+            {
+                let mut cache = state.coin_price_cache.write();
+                *cache = Some(CachedValue::new(price.clone()));
+            }
+            Some(price)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch Chainlink price: {}", e);
+            None
+        }
+    }
 }
 
 fn hex_to_u128(hex: &str) -> u128 {
@@ -2323,6 +2794,49 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+async fn health_check(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    // Health check endpoint with database connectivity status
+    // Returns 200 OK if database is accessible, 503 SERVICE_UNAVAILABLE if not
+
+    match state.index.last_indexed_block().await {
+        Ok(Some(block)) => {
+            // Database is accessible and has data
+            let backend = "mdbx";
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "healthy",
+                    "last_block": block,
+                    "backend": backend
+                }))
+            )
+        }
+        Ok(None) => {
+            // Database is accessible but no data yet (initializing)
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "initializing",
+                    "last_block": null,
+                    "backend": "mdbx"
+                }))
+            )
+        }
+        Err(e) => {
+            // Database is not accessible
+            tracing::error!("Health check failed: {}", e);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "unhealthy",
+                    "error": "database_unavailable"
+                }))
+            )
+        }
+    }
+}
+
 async fn indexing_status(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     let last_indexed = state.index.last_indexed_block().await.unwrap_or(None).unwrap_or(0);
     
@@ -2331,7 +2845,8 @@ async fn indexing_status(State(state): State<Arc<ApiState>>) -> impl IntoRespons
         match get_chain_head(rpc_url).await {
             Ok(head) => {
                 let behind = if head > last_indexed { head - last_indexed } else { 0 };
-                let finished = behind <= 1; // Allow 1 block lag
+                // Allow up to 20 blocks lag since we do periodic backfill (not live indexing)
+                let finished = behind <= 20;
                 (Some(head), behind, finished)
             }
             Err(_) => (None, 0, true)
@@ -2342,7 +2857,14 @@ async fn indexing_status(State(state): State<Arc<ApiState>>) -> impl IntoRespons
 
     let ratio = if let Some(head) = chain_head {
         if head > 0 {
-            format!("{:.4}", last_indexed as f64 / head as f64)
+            let raw_ratio = last_indexed as f64 / head as f64;
+            // Cap at 0.9999 if not finished to prevent UI showing 100% while still indexing
+            let capped = if !finished && raw_ratio >= 0.9999 {
+                0.9999
+            } else {
+                raw_ratio
+            };
+            format!("{:.4}", capped)
         } else {
             "1.00".to_string()
         }

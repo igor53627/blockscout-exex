@@ -1,9 +1,10 @@
-//! Live block subscription - keeps index updated with new blocks
+//! Live block subscription - keeps MDBX index updated with new blocks
 //!
 //! Subscribes to new blocks via WebSocket and indexes them in real-time.
 //! Also catches up on any missed blocks between last_indexed and chain head.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, Log, TxHash};
@@ -14,12 +15,15 @@ use serde::Deserialize;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-use blockscout_exex::fdb_index::{FdbIndex, TokenTransfer};
+use blockscout_exex::index_trait::TokenTransfer;
+#[cfg(feature = "mdbx")]
+use blockscout_exex::mdbx_index::MdbxIndex;
 use blockscout_exex::transform::{decode_token_transfer, TokenType};
+use blockscout_exex::IndexDatabase;
 
 #[derive(Parser)]
 #[command(name = "blockscout-subscriber")]
-#[command(about = "Subscribe to new blocks and index them")]
+#[command(about = "Subscribe to new blocks and index them into MDBX")]
 struct Args {
     /// WebSocket endpoint URL
     #[arg(long, default_value = "ws://localhost:8546")]
@@ -29,9 +33,10 @@ struct Args {
     #[arg(long, default_value = "http://localhost:8545")]
     rpc_url: String,
 
-    /// FoundationDB cluster file path (uses default if not specified)
+    /// MDBX database path
+    #[cfg(feature = "mdbx")]
     #[arg(long)]
-    cluster_file: Option<PathBuf>,
+    mdbx_path: PathBuf,
 
     /// Reconnect delay on disconnect (seconds)
     #[arg(long, default_value = "5")]
@@ -178,8 +183,10 @@ fn parse_tx_index(tx: &RpcTransaction) -> u32 {
         .unwrap_or(0)
 }
 
+// Index a block into MDBX
+#[cfg(feature = "mdbx")]
 async fn index_block(
-    index: &FdbIndex,
+    index: &MdbxIndex,
     rpc: &RpcClient,
     block_number: u64,
     block_hash: Option<&str>,
@@ -205,10 +212,10 @@ async fn index_block(
 
     let mut batch = index.write_batch();
 
-    for tx in block.transactions {
+    for tx in &block.transactions {
         let tx_hash: TxHash = tx.hash.parse()?;
         let from: Address = tx.from.parse()?;
-        let tx_idx = parse_tx_index(&tx);
+        let tx_idx = parse_tx_index(tx);
 
         batch.insert_address_tx(from, tx_hash, block_number, tx_idx);
 
@@ -223,7 +230,6 @@ async fn index_block(
         if let Some(receipt) = receipt_map.get(&tx.hash) {
             for (log_index, rpc_log) in receipt.logs.iter().enumerate() {
                 if let Some(log) = parse_log(rpc_log) {
-                    // Use unified decoder for ERC-20, ERC-721, ERC-1155
                     let decoded_transfers = decode_token_transfer(&log);
                     for decoded in decoded_transfers {
                         let transfer = match decoded.token_type {
@@ -266,13 +272,14 @@ async fn index_block(
         }
     }
 
-    batch.commit(block_number).await?;
+    batch.commit(block_number)?;
     Ok(())
 }
 
 /// Catch up on any missed blocks between last_indexed and chain head
+#[cfg(feature = "mdbx")]
 async fn catchup_missed_blocks(
-    index: &FdbIndex,
+    index: &MdbxIndex,
     rpc: &RpcClient,
     batch_size: u64,
 ) -> Result<u64> {
@@ -303,7 +310,6 @@ async fn catchup_missed_blocks(
         for block_num in current..=batch_end {
             if let Err(e) = index_block(index, rpc, block_num, None).await {
                 error!("Failed to index block {}: {}", block_num, e);
-                // Continue with next block, don't fail the whole catchup
             }
         }
 
@@ -324,7 +330,8 @@ async fn catchup_missed_blocks(
     Ok(chain_head)
 }
 
-async fn subscribe_loop(args: &Args, index: &FdbIndex) -> Result<()> {
+#[cfg(feature = "mdbx")]
+async fn subscribe_loop(args: &Args, index: &MdbxIndex) -> Result<()> {
     let rpc = RpcClient::new(&args.rpc_url);
 
     // First, catch up on any missed blocks
@@ -427,31 +434,30 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Initialize FDB network
-    let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
+    #[cfg(feature = "mdbx")]
+    {
+        info!("Using MDBX backend at: {:?}", args.mdbx_path);
+        let index = MdbxIndex::open(&args.mdbx_path)?;
 
-    info!("Connecting to FoundationDB...");
-    let index = match &args.cluster_file {
-        Some(path) => {
-            info!("Using cluster file: {:?}", path);
-            FdbIndex::open(path)?
-        }
-        None => {
-            info!("Using default cluster file");
-            FdbIndex::open_default()?
-        }
-    };
+        let last_block = index.last_indexed_block().await?;
+        info!("Last indexed block: {:?}", last_block);
 
-    loop {
-        match subscribe_loop(&args, &index).await {
-            Ok(_) => {
-                info!("Subscription ended, reconnecting...");
+        loop {
+            match subscribe_loop(&args, &index).await {
+                Ok(_) => {
+                    info!("Subscription ended, reconnecting...");
+                }
+                Err(e) => {
+                    error!("Subscription error: {}, reconnecting...", e);
+                }
             }
-            Err(e) => {
-                error!("Subscription error: {}, reconnecting...", e);
-            }
-        }
 
-        tokio::time::sleep(Duration::from_secs(args.reconnect_delay)).await;
+            tokio::time::sleep(Duration::from_secs(args.reconnect_delay)).await;
+        }
+    }
+
+    #[cfg(not(feature = "mdbx"))]
+    {
+        eyre::bail!("MDBX feature not enabled. Build with --features mdbx");
     }
 }

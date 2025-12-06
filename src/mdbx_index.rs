@@ -1,0 +1,1764 @@
+//! MDBX-based index storage for Blockscout data.
+//!
+//! This module provides MDBX (libmdbx) database implementation as a replacement
+//! for FoundationDB, using reth's database abstractions for compatibility.
+//!
+//! Schema matches FDB implementation for data compatibility:
+//! - AddressTxs: (address:20, block:8, tx_idx:4) -> tx_hash:32
+//! - AddressTransfers: (address:20, block:8, log_idx:8) -> TokenTransfer
+//! - TokenHolders: (token:20, holder:20) -> balance:32
+//! - TxBlocks: tx_hash:32 -> block_number:8
+//! - TokenTransfers: (token:20, block:8, log_idx:8) -> TokenTransfer
+//! - Metadata: key -> value (version, last_block, etc.)
+//! - Counters: name -> i64_le
+//! - AddressCounters: (address:20, kind:1) -> i64_le
+//! - TokenHolderCounts: token:20 -> i64_le
+//! - DailyMetrics: (year:2, month:1, day:1, metric:1) -> i64_le
+
+#[cfg(feature = "reth")]
+use reth_db::mdbx::{DatabaseEnv, DatabaseEnvKind, DatabaseArguments};
+#[cfg(feature = "reth")]
+use reth_db_api::{database::Database, models::ClientVersion, transaction::DbTx};
+#[cfg(feature = "reth")]
+use reth_libmdbx::{WriteFlags, DatabaseFlags};
+
+// Table name constants for our custom index schema
+#[cfg(feature = "reth")]
+mod tables {
+    pub const ADDRESS_TXS: &str = "AddressTxs";
+    pub const TX_BLOCKS: &str = "TxBlocks";
+    pub const ADDRESS_TRANSFERS: &str = "AddressTransfers";
+    pub const TOKEN_TRANSFERS: &str = "TokenTransfers";
+    pub const TOKEN_HOLDERS: &str = "TokenHolders";
+    pub const COUNTERS: &str = "Counters";
+    pub const ADDRESS_COUNTERS: &str = "AddressCounters";
+    pub const TOKEN_HOLDER_COUNTS: &str = "TokenHolderCounts";
+    pub const DAILY_METRICS: &str = "DailyMetrics";
+    pub const METADATA: &str = "Metadata";
+}
+
+use std::path::Path;
+use std::sync::Arc;
+use std::hash::Hash;
+use eyre::Result;
+use alloy_primitives::Address;
+
+// Import buffer pool for zero-allocation key encoding
+use crate::buffer_pool::{get_buffer, BufferGuard};
+
+// Re-export TokenTransfer from index_trait for compatibility
+pub use crate::index_trait::TokenTransfer;
+
+use hyperloglogplus::HyperLogLogPlus;
+use std::collections::hash_map::RandomState;
+
+/// Type alias for HyperLogLog used for address counting
+pub type AddressHll = HyperLogLogPlus<AddressWrapper, RandomState>;
+
+/// Wrapper for Address to implement Hash trait for HyperLogLog
+#[derive(Clone, Copy)]
+pub struct AddressWrapper(pub Address);
+
+impl Hash for AddressWrapper {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_slice().hash(state);
+    }
+}
+
+const SCHEMA_VERSION: u32 = 1;
+const META_SCHEMA_VERSION: &[u8] = b"schema_version";
+
+// ============================================================================
+// Composite Key Types with Encode/Decode (Subtask 1.2)
+// ============================================================================
+
+/// Key for address -> transaction mappings: (address, block, tx_idx)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTxKey {
+    address: Address,
+    block: u64,
+    tx_idx: u32,
+}
+
+/// Key for token -> transfer mappings: (token, block, log_idx)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenTransferKey {
+    token: Address,
+    block: u64,
+    log_idx: u64,
+}
+
+/// Key for address counter mappings: (address, kind)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AddressCounterKey {
+    address: Address,
+    kind: u8,
+}
+
+/// Key for daily metrics: (year, month, day, metric)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyMetricKey {
+    year: u16,
+    month: u8,
+    day: u8,
+    metric: u8,
+}
+
+impl AddressTxKey {
+    pub fn new(address: Address, block: u64, tx_idx: u32) -> Self {
+        Self {
+            address,
+            block,
+            tx_idx,
+        }
+    }
+
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    pub fn tx_idx(&self) -> u32 {
+        self.tx_idx
+    }
+
+    /// Encode key to bytes (big-endian for lexicographic ordering)
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(20 + 8 + 4);
+        bytes.extend_from_slice(self.address.as_slice());
+        bytes.extend_from_slice(&self.block.to_be_bytes());
+        bytes.extend_from_slice(&self.tx_idx.to_be_bytes());
+        bytes
+    }
+
+    /// Decode key from bytes
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 32 {
+            return Err(eyre::eyre!("Invalid AddressTxKey length: {}", bytes.len()));
+        }
+        let address = Address::from_slice(&bytes[0..20]);
+        let block = u64::from_be_bytes(bytes[20..28].try_into()?);
+        let tx_idx = u32::from_be_bytes(bytes[28..32].try_into()?);
+        Ok(Self {
+            address,
+            block,
+            tx_idx,
+        })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    /// Returns a BufferGuard that auto-returns to pool on drop
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.address.as_slice());
+        buf.extend_from_slice(&self.block.to_be_bytes());
+        buf.extend_from_slice(&self.tx_idx.to_be_bytes());
+        buf
+    }
+
+    /// Encode just the address prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(address: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(address.as_slice());
+        buf
+    }
+}
+
+/// Key for address -> transfer mappings: (address, block, log_idx)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTransferKey {
+    address: Address,
+    block: u64,
+    log_idx: u64,
+}
+
+impl AddressTransferKey {
+    pub fn new(address: Address, block: u64, log_idx: u64) -> Self {
+        Self {
+            address,
+            block,
+            log_idx,
+        }
+    }
+
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    pub fn log_idx(&self) -> u64 {
+        self.log_idx
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(20 + 8 + 8);
+        bytes.extend_from_slice(self.address.as_slice());
+        bytes.extend_from_slice(&self.block.to_be_bytes());
+        bytes.extend_from_slice(&self.log_idx.to_be_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 36 {
+            return Err(eyre::eyre!(
+                "Invalid AddressTransferKey length: {}",
+                bytes.len()
+            ));
+        }
+        let address = Address::from_slice(&bytes[0..20]);
+        let block = u64::from_be_bytes(bytes[20..28].try_into()?);
+        let log_idx = u64::from_be_bytes(bytes[28..36].try_into()?);
+        Ok(Self {
+            address,
+            block,
+            log_idx,
+        })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.address.as_slice());
+        buf.extend_from_slice(&self.block.to_be_bytes());
+        buf.extend_from_slice(&self.log_idx.to_be_bytes());
+        buf
+    }
+
+    /// Encode just the address prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(address: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(address.as_slice());
+        buf
+    }
+}
+
+/// Key for token holder mappings: (token, holder)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TokenHolderKey {
+    token: Address,
+    holder: Address,
+}
+
+impl TokenHolderKey {
+    pub fn new(token: Address, holder: Address) -> Self {
+        Self { token, holder }
+    }
+
+    pub fn token(&self) -> Address {
+        self.token
+    }
+
+    pub fn holder(&self) -> Address {
+        self.holder
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(40);
+        bytes.extend_from_slice(self.token.as_slice());
+        bytes.extend_from_slice(self.holder.as_slice());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 40 {
+            return Err(eyre::eyre!(
+                "Invalid TokenHolderKey length: {}",
+                bytes.len()
+            ));
+        }
+        let token = Address::from_slice(&bytes[0..20]);
+        let holder = Address::from_slice(&bytes[20..40]);
+        Ok(Self { token, holder })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.token.as_slice());
+        buf.extend_from_slice(self.holder.as_slice());
+        buf
+    }
+
+    /// Encode just the token prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(token: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(token.as_slice());
+        buf
+    }
+}
+
+impl TokenTransferKey {
+    pub fn new(token: Address, block: u64, log_idx: u64) -> Self {
+        Self { token, block, log_idx }
+    }
+
+    pub fn token(&self) -> Address {
+        self.token
+    }
+
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    pub fn log_idx(&self) -> u64 {
+        self.log_idx
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(20 + 8 + 8);
+        bytes.extend_from_slice(self.token.as_slice());
+        bytes.extend_from_slice(&self.block.to_be_bytes());
+        bytes.extend_from_slice(&self.log_idx.to_be_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 36 {
+            return Err(eyre::eyre!("Invalid TokenTransferKey length: {}", bytes.len()));
+        }
+        let token = Address::from_slice(&bytes[0..20]);
+        let block = u64::from_be_bytes(bytes[20..28].try_into()?);
+        let log_idx = u64::from_be_bytes(bytes[28..36].try_into()?);
+        Ok(Self { token, block, log_idx })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.token.as_slice());
+        buf.extend_from_slice(&self.block.to_be_bytes());
+        buf.extend_from_slice(&self.log_idx.to_be_bytes());
+        buf
+    }
+
+    /// Encode just the token prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(token: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(token.as_slice());
+        buf
+    }
+}
+
+impl AddressCounterKey {
+    pub fn new(address: Address, kind: u8) -> Self {
+        Self { address, kind }
+    }
+
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    pub fn kind(&self) -> u8 {
+        self.kind
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(21);
+        bytes.extend_from_slice(self.address.as_slice());
+        bytes.push(self.kind);
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 21 {
+            return Err(eyre::eyre!("Invalid AddressCounterKey length: {}", bytes.len()));
+        }
+        let address = Address::from_slice(&bytes[0..20]);
+        let kind = bytes[20];
+        Ok(Self { address, kind })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.address.as_slice());
+        buf.push(self.kind);
+        buf
+    }
+}
+
+impl DailyMetricKey {
+    pub fn new(year: u16, month: u8, day: u8, metric: u8) -> Self {
+        Self { year, month, day, metric }
+    }
+
+    pub fn year(&self) -> u16 {
+        self.year
+    }
+
+    pub fn month(&self) -> u8 {
+        self.month
+    }
+
+    pub fn day(&self) -> u8 {
+        self.day
+    }
+
+    pub fn metric(&self) -> u8 {
+        self.metric
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(5);
+        bytes.extend_from_slice(&self.year.to_be_bytes());
+        bytes.push(self.month);
+        bytes.push(self.day);
+        bytes.push(self.metric);
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 5 {
+            return Err(eyre::eyre!("Invalid DailyMetricKey length: {}", bytes.len()));
+        }
+        let year = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let month = bytes[2];
+        let day = bytes[3];
+        let metric = bytes[4];
+        Ok(Self { year, month, day, metric })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(&self.year.to_be_bytes());
+        buf.push(self.month);
+        buf.push(self.day);
+        buf.push(self.metric);
+        buf
+    }
+}
+
+// ============================================================================
+// MDBX Environment and Core Structures (Subtask 1.1)
+// ============================================================================
+
+/// MDBX-based index for Blockscout data
+///
+/// Configuration:
+/// - Map size: 256GB initial (auto-grows as needed)
+/// - Max readers: 256 concurrent read transactions
+/// - SafeNoSync mode for better write performance
+pub struct MdbxIndex {
+    #[cfg(feature = "reth")]
+    env: Arc<DatabaseEnv>,
+    #[cfg(not(feature = "reth"))]
+    _phantom: std::marker::PhantomData<()>,
+}
+
+impl MdbxIndex {
+    /// Open or create an MDBX database at the specified path
+    ///
+    /// Configuration:
+    /// - 256GB max map size with auto-grow
+    /// - 256 max concurrent readers
+    /// - SafeNoSync for performance
+    #[cfg(feature = "reth")]
+    pub fn open(path: &Path) -> Result<Self> {
+        use reth_db::mdbx::SyncMode;
+
+        const GIGABYTE: usize = 1024 * 1024 * 1024;
+
+        // Create database arguments with custom geometry
+        let args = DatabaseArguments::new(ClientVersion::default())
+            .with_max_readers(Some(256))
+            .with_geometry_max_size(Some(1536 * GIGABYTE))  // 1.5TB max
+            .with_sync_mode(Some(SyncMode::SafeNoSync));
+
+        let env = DatabaseEnv::open(path, DatabaseEnvKind::RW, args)?;
+
+        Ok(Self {
+            env: Arc::new(env),
+        })
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn open(_path: &Path) -> Result<Self> {
+        Err(eyre::eyre!(
+            "MDBX support requires 'reth' feature to be enabled"
+        ))
+    }
+
+    /// Open an MDBX database in read-only mode
+    ///
+    /// This allows concurrent reads while another process is writing.
+    /// Use this for the API server when backfill is running.
+    #[cfg(feature = "reth")]
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        const GIGABYTE: usize = 1024 * 1024 * 1024;
+
+        let args = DatabaseArguments::new(ClientVersion::default())
+            .with_max_readers(Some(256))
+            .with_geometry_max_size(Some(1536 * GIGABYTE));  // 1.5TB - must match write mode
+
+        let env = DatabaseEnv::open(path, DatabaseEnvKind::RO, args)?;
+
+        Ok(Self {
+            env: Arc::new(env),
+        })
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn open_readonly(_path: &Path) -> Result<Self> {
+        Err(eyre::eyre!(
+            "MDBX support requires 'reth' feature to be enabled"
+        ))
+    }
+
+    /// Get schema version from metadata
+    /// Returns 1 for new databases or stored version
+    #[cfg(feature = "reth")]
+    pub fn get_schema_version(&self) -> Result<u32> {
+        let tx = self.env.tx()?;
+
+        // Try to open metadata table (may not exist yet)
+        let metadata_db = match tx.inner.open_db(Some(tables::METADATA)) {
+            Ok(db) => db,
+            Err(_) => return Ok(SCHEMA_VERSION), // Table doesn't exist yet
+        };
+
+        match tx.inner.get::<Vec<u8>>(metadata_db.dbi(), b"schema_version") {
+            Ok(Some(bytes)) if bytes.len() >= 4 => {
+                let version = u32::from_be_bytes(bytes[..4].try_into().unwrap_or([0u8; 4]));
+                Ok(version)
+            }
+            _ => Ok(SCHEMA_VERSION),
+        }
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_schema_version(&self) -> Result<u32> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Set schema version in metadata
+    #[cfg(feature = "reth")]
+    pub fn set_schema_version(&self, version: u32) -> Result<()> {
+        let tx = self.env.tx_mut()?;
+
+        let metadata_db = tx.inner.create_db(Some(tables::METADATA), reth_libmdbx::DatabaseFlags::default())?;
+        tx.inner.put(metadata_db.dbi(), b"schema_version", &version.to_be_bytes(), reth_libmdbx::WriteFlags::UPSERT)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn set_schema_version(&self, _version: u32) -> Result<()> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get last indexed block from metadata, with fallback to Counters table
+    #[cfg(feature = "reth")]
+    pub fn get_last_indexed_block(&self) -> Result<Option<u64>> {
+        let tx = self.env.tx()?;
+
+        // First try Metadata table (primary source, BE encoding)
+        if let Ok(metadata_db) = tx.inner.open_db(Some(tables::METADATA)) {
+            if let Ok(Some(bytes)) = tx.inner.get::<Vec<u8>>(metadata_db.dbi(), b"last_block") {
+                if bytes.len() >= 8 {
+                    let block = u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                    if block > 0 {
+                        return Ok(Some(block));
+                    }
+                }
+            }
+        }
+
+        // Fallback to Counters table (stored by update_counters, LE i64 encoding)
+        if let Ok(counters_db) = tx.inner.open_db(Some(tables::COUNTERS)) {
+            if let Ok(Some(bytes)) = tx.inner.get::<Vec<u8>>(counters_db.dbi(), b"last_block") {
+                if bytes.len() >= 8 {
+                    let block = i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                    if block > 0 {
+                        return Ok(Some(block as u64));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_last_indexed_block(&self) -> Result<Option<u64>> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Set last indexed block in metadata
+    #[cfg(feature = "reth")]
+    pub fn set_last_indexed_block(&self, block: u64) -> Result<()> {
+        let tx = self.env.tx_mut()?;
+
+        let metadata_db = tx.inner.create_db(Some(tables::METADATA), reth_libmdbx::DatabaseFlags::default())?;
+        tx.inner.put(metadata_db.dbi(), b"last_block", &block.to_be_bytes(), reth_libmdbx::WriteFlags::UPSERT)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn set_last_indexed_block(&self, _block: u64) -> Result<()> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Begin a read-only transaction
+    #[cfg(feature = "reth")]
+    pub fn begin_read(&self) -> Result<MdbxReadTransaction> {
+        let tx = self.env.tx()?;
+        Ok(MdbxReadTransaction { _tx: tx })
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn begin_read(&self) -> Result<MdbxReadTransaction> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Begin a read-write transaction
+    #[cfg(feature = "reth")]
+    pub fn begin_write(&self) -> Result<MdbxWriteTransaction> {
+        let tx = self.env.tx_mut()?;
+        Ok(MdbxWriteTransaction { _tx: tx })
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn begin_write(&self) -> Result<MdbxWriteTransaction> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    // ============================================================================
+    // Read Operations (Subtask 1.4)
+    // ============================================================================
+
+    /// Get address transactions with pagination
+    #[cfg(feature = "reth")]
+    pub fn get_address_txs(
+        &self,
+        address: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<alloy_primitives::TxHash>> {
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let addr_txs_db = match tx.inner.open_db(Some(tables::ADDRESS_TXS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()), // Table doesn't exist yet
+        };
+
+        let mut cursor = tx.inner.cursor(&addr_txs_db)?;
+
+        // Seek to the address prefix (address is 20 bytes at start of key)
+        let prefix = address.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        // Position cursor at or after the first key with this address prefix
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        // Iterate through entries with matching prefix
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    // Check if key still has our address prefix
+                    if key.len() < 20 || &key[..20] != prefix {
+                        break; // Different address, we're done
+                    }
+
+                    // Handle offset/limit
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        // Value is the tx_hash (32 bytes)
+                        if value.len() >= 32 {
+                            let tx_hash = alloy_primitives::TxHash::from_slice(&value[..32]);
+                            results.push(tx_hash);
+                        }
+                    } else {
+                        break; // Reached limit
+                    }
+
+                    // Move to next entry
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_address_txs(
+        &self,
+        _address: &Address,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<alloy_primitives::TxHash>> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get address transfers with pagination
+    #[cfg(feature = "reth")]
+    pub fn get_address_transfers(
+        &self,
+        address: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<TokenTransfer>> {
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let addr_transfers_db = match tx.inner.open_db(Some(tables::ADDRESS_TRANSFERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut cursor = tx.inner.cursor(&addr_transfers_db)?;
+
+        let prefix = address.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    if key.len() < 20 || &key[..20] != prefix {
+                        break;
+                    }
+
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        // Deserialize the transfer
+                        if let Ok(transfer) = bincode::deserialize::<TokenTransfer>(&value) {
+                            results.push(transfer);
+                        }
+                    } else {
+                        break;
+                    }
+
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_address_transfers(
+        &self,
+        _address: &Address,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<TokenTransfer>> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get token holders with pagination
+    #[cfg(feature = "reth")]
+    pub fn get_token_holders(
+        &self,
+        token: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(Address, alloy_primitives::U256)>> {
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let token_holders_db = match tx.inner.open_db(Some(tables::TOKEN_HOLDERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut cursor = tx.inner.cursor(&token_holders_db)?;
+
+        // Key is (token:20, holder:20), value is balance:32
+        let prefix = token.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    // Key must be 40 bytes (token:20 + holder:20)
+                    if key.len() < 40 || &key[..20] != prefix {
+                        break;
+                    }
+
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        // Extract holder address from key
+                        let holder = Address::from_slice(&key[20..40]);
+                        // Balance is stored as big-endian U256
+                        if value.len() >= 32 {
+                            let balance = alloy_primitives::U256::from_be_slice(&value[..32]);
+                            // Only include non-zero balances
+                            if balance > alloy_primitives::U256::ZERO {
+                                results.push((holder, balance));
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_token_holders(
+        &self,
+        _token: &Address,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<(Address, alloy_primitives::U256)>> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get token transfers with pagination
+    #[cfg(feature = "reth")]
+    pub fn get_token_transfers(
+        &self,
+        token: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<TokenTransfer>> {
+        use reth_libmdbx::Cursor;
+
+        let tx = self.env.tx()?;
+
+        let token_transfers_db = match tx.inner.open_db(Some(tables::TOKEN_TRANSFERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut cursor = tx.inner.cursor(&token_transfers_db)?;
+
+        let prefix = token.as_slice();
+        let mut results = Vec::new();
+        let mut skipped = 0;
+
+        if cursor.set_range::<(), ()>(prefix)?.is_none() {
+            return Ok(Vec::new());
+        }
+
+        loop {
+            match cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                Some((key, value)) => {
+                    if key.len() < 20 || &key[..20] != prefix {
+                        break;
+                    }
+
+                    if skipped < offset {
+                        skipped += 1;
+                    } else if results.len() < limit {
+                        if let Ok(transfer) = bincode::deserialize::<TokenTransfer>(&value) {
+                            results.push(transfer);
+                        }
+                    } else {
+                        break;
+                    }
+
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_token_transfers(
+        &self,
+        _token: &Address,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<TokenTransfer>> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get block number for a transaction hash
+    #[cfg(feature = "reth")]
+    pub fn get_tx_block(&self, tx_hash: &alloy_primitives::TxHash) -> Result<Option<u64>> {
+        let tx = self.env.tx()?;
+
+        let tx_blocks_db = match tx.inner.open_db(Some(tables::TX_BLOCKS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(None),
+        };
+
+        match tx.inner.get::<Vec<u8>>(tx_blocks_db.dbi(), tx_hash.as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                let block = u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                Ok(Some(block))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_tx_block(&self, _tx_hash: &alloy_primitives::TxHash) -> Result<Option<u64>> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get total transaction count
+    #[cfg(feature = "reth")]
+    pub fn get_total_txs(&self) -> Result<u64> {
+        self.get_counter(b"total_txs").map(|c| c as u64)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_total_txs(&self) -> Result<u64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get total transfer count
+    #[cfg(feature = "reth")]
+    pub fn get_total_transfers(&self) -> Result<u64> {
+        self.get_counter(b"total_transfers").map(|c| c as u64)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_total_transfers(&self) -> Result<u64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get total unique address count
+    #[cfg(feature = "reth")]
+    pub fn get_total_addresses(&self) -> Result<u64> {
+        self.get_counter(b"total_addresses").map(|c| c as u64)
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_total_addresses(&self) -> Result<u64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    // ============================================================================
+    // Write Operations (Subtask 1.5)
+    // ============================================================================
+
+    /// Create a new write batch
+    #[cfg(feature = "reth")]
+    pub fn write_batch(&self) -> MdbxWriteBatch {
+        MdbxWriteBatch {
+            env: Arc::clone(&self.env),
+            address_txs: Vec::new(),
+            tx_blocks: Vec::new(),
+            transfers: Vec::new(),
+            holder_updates: Vec::new(),
+            counter_deltas: std::collections::HashMap::new(),
+            address_counter_deltas: std::collections::HashMap::new(),
+            daily_metrics: Vec::new(),
+            seen_addresses: std::collections::HashSet::new(),
+            batch_balances: std::collections::HashMap::new(),
+        }
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn write_batch(&self) -> MdbxWriteBatch {
+        MdbxWriteBatch {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Get counter value
+    #[cfg(feature = "reth")]
+    pub fn get_counter(&self, name: &[u8]) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let counters_db = match tx.inner.open_db(Some(tables::COUNTERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        match tx.inner.get::<Vec<u8>>(counters_db.dbi(), name) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_counter(&self, _name: &[u8]) -> Result<i64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get address counter
+    #[cfg(feature = "reth")]
+    pub fn get_address_counter(&self, address: &Address, kind: u8) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let addr_counters_db = match tx.inner.open_db(Some(tables::ADDRESS_COUNTERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        let key = AddressCounterKey::new(*address, kind);
+        match tx.inner.get::<Vec<u8>>(addr_counters_db.dbi(), key.encode().as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_address_counter(&self, _address: &Address, _kind: u8) -> Result<i64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get token holder count
+    #[cfg(feature = "reth")]
+    pub fn get_token_holder_count(&self, token: &Address) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let holder_counts_db = match tx.inner.open_db(Some(tables::TOKEN_HOLDER_COUNTS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        match tx.inner.get::<Vec<u8>>(holder_counts_db.dbi(), token.as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_token_holder_count(&self, _token: &Address) -> Result<i64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Get daily metric
+    #[cfg(feature = "reth")]
+    pub fn get_daily_metric(&self, year: u16, month: u8, day: u8, metric: u8) -> Result<i64> {
+        let tx = self.env.tx()?;
+
+        let daily_metrics_db = match tx.inner.open_db(Some(tables::DAILY_METRICS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(0), // Table doesn't exist yet
+        };
+
+        let key = DailyMetricKey::new(year, month, day, metric);
+        let key_bytes = key.encode();
+
+        match tx.inner.get::<Vec<u8>>(daily_metrics_db.dbi(), key_bytes.as_slice()) {
+            Ok(Some(bytes)) if bytes.len() >= 8 => {
+                Ok(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8])))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn get_daily_metric(&self, _year: u16, _month: u8, _day: u8, _metric: u8) -> Result<i64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    // ============================================================================
+    // HyperLogLog Support (for address counting)
+    // ============================================================================
+
+    /// Create a new empty HyperLogLog for address counting
+    /// Uses same precision as FDB (14 bits = ~16K registers)
+    pub fn new_address_hll() -> AddressHll {
+        use hyperloglogplus::HyperLogLogPlus;
+        use std::collections::hash_map::RandomState;
+        const HLL_PRECISION: u8 = 14;
+        HyperLogLogPlus::new(HLL_PRECISION, RandomState::new()).unwrap()
+    }
+
+    /// Load the address HLL count from MDBX (we store just the count, not full HLL)
+    #[cfg(feature = "reth")]
+    pub fn load_address_hll_count(&self) -> Result<u64> {
+        // Read from total_addresses counter
+        self.get_total_addresses()
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn load_address_hll_count(&self) -> Result<u64> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+
+    /// Save the address HLL count to MDBX
+    #[cfg(feature = "reth")]
+    pub fn save_address_hll_count(&self, count: u64) -> Result<()> {
+        let tx = self.env.tx_mut()?;
+        let counters_db = tx.inner.create_db(Some(tables::COUNTERS), DatabaseFlags::default())?;
+
+        // Store the HLL count as total_addresses counter
+        tx.inner.put(
+            counters_db.dbi(),
+            b"total_addresses",
+            &(count as i64).to_le_bytes(),
+            WriteFlags::UPSERT
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "reth"))]
+    pub fn save_address_hll_count(&self, _count: u64) -> Result<()> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+}
+
+// Transaction wrapper types
+pub struct MdbxReadTransaction {
+    #[cfg(feature = "reth")]
+    _tx: <DatabaseEnv as Database>::TX,
+    #[cfg(not(feature = "reth"))]
+    _phantom: std::marker::PhantomData<()>,
+}
+
+pub struct MdbxWriteTransaction {
+    #[cfg(feature = "reth")]
+    _tx: <DatabaseEnv as Database>::TXMut,
+    #[cfg(not(feature = "reth"))]
+    _phantom: std::marker::PhantomData<()>,
+}
+
+// ============================================================================
+// Table Type Markers (Subtask 1.2)
+// ============================================================================
+
+/// Marker type for MDBX tables
+pub struct MdbxTable<T> {
+    _phantom: std::marker::PhantomData<T>,
+}
+
+/// Table: AddressTxs - (address:20, block:8, tx_idx:4) -> tx_hash:32
+pub struct AddressTxs;
+
+/// Table: AddressTransfers - (address:20, block:8, log_idx:8) -> TokenTransfer
+pub struct AddressTransfers;
+
+/// Table: TokenHolders - (token:20, holder:20) -> balance:32
+pub struct TokenHolders;
+
+/// Table: TxBlocks - tx_hash:32 -> block_number:8
+pub struct TxBlocks;
+
+/// Table: TokenTransfers - (token:20, block:8, log_idx:8) -> TokenTransfer
+pub struct TokenTransfers;
+
+/// Table: Metadata - key -> value
+pub struct Metadata;
+
+/// Table: Counters - name -> i64_le
+pub struct Counters;
+
+/// Table: AddressCounters - (address:20, kind:1) -> i64_le
+pub struct AddressCounters;
+
+/// Table: TokenHolderCounts - token:20 -> i64_le
+pub struct TokenHolderCounts;
+
+/// Table: DailyMetrics - (year:2, month:1, day:1, metric:1) -> i64_le
+pub struct DailyMetrics;
+
+// ============================================================================
+// Write Batch Implementation (Subtask 1.5)
+// ============================================================================
+
+/// Batch writer for atomic write operations
+pub struct MdbxWriteBatch {
+    #[cfg(feature = "reth")]
+    env: Arc<DatabaseEnv>,
+    #[cfg(feature = "reth")]
+    address_txs: Vec<(AddressTxKey, alloy_primitives::TxHash)>,
+    #[cfg(feature = "reth")]
+    tx_blocks: Vec<(alloy_primitives::TxHash, u64)>,
+    #[cfg(feature = "reth")]
+    transfers: Vec<TokenTransfer>,
+    #[cfg(feature = "reth")]
+    holder_updates: Vec<(TokenHolderKey, alloy_primitives::U256, Option<alloy_primitives::U256>)>,
+    #[cfg(feature = "reth")]
+    counter_deltas: std::collections::HashMap<Vec<u8>, i64>,
+    #[cfg(feature = "reth")]
+    address_counter_deltas: std::collections::HashMap<AddressCounterKey, i64>,
+    #[cfg(feature = "reth")]
+    daily_metrics: Vec<(DailyMetricKey, i64)>,
+    #[cfg(feature = "reth")]
+    seen_addresses: std::collections::HashSet<Address>,
+    #[cfg(feature = "reth")]
+    /// Track balances within this batch for holder count calculations
+    batch_balances: std::collections::HashMap<TokenHolderKey, alloy_primitives::U256>,
+    #[cfg(not(feature = "reth"))]
+    _phantom: std::marker::PhantomData<()>,
+}
+
+#[cfg(feature = "reth")]
+impl MdbxWriteBatch {
+    /// Insert an address transaction mapping
+    pub fn insert_address_tx(
+        &mut self,
+        address: Address,
+        tx_hash: alloy_primitives::TxHash,
+        block: u64,
+        tx_idx: u32,
+    ) {
+        let key = AddressTxKey::new(address, block, tx_idx);
+        self.address_txs.push((key, tx_hash));
+
+        // Increment per-address transaction counter (kind=0 for txs)
+        self.increment_address_counter(address, 0, 1);
+
+        // Track address for HLL (total_addresses is managed by HLL in backfill code)
+        self.seen_addresses.insert(address);
+    }
+
+    /// Insert a transaction -> block mapping
+    pub fn insert_tx_block(&mut self, tx_hash: alloy_primitives::TxHash, block: u64) {
+        self.tx_blocks.push((tx_hash, block));
+
+        // Increment total_txs counter (this is called once per transaction)
+        self.increment_counter(b"total_txs", 1);
+    }
+
+    /// Insert a token transfer
+    pub fn insert_transfer(&mut self, transfer: TokenTransfer) {
+        // Increment total_transfers counter
+        self.increment_counter(b"total_transfers", 1);
+
+        // Increment per-address transfer counters (kind=1 for transfers)
+        let from_addr = Address::from_slice(&transfer.from);
+        let to_addr = Address::from_slice(&transfer.to);
+
+        self.increment_address_counter(from_addr, 1, 1);
+        // Only count 'to' address if different from 'from' to avoid double-counting self-transfers
+        if from_addr != to_addr {
+            self.increment_address_counter(to_addr, 1, 1);
+        }
+
+        // Track unique addresses (will be counted during commit)
+        self.seen_addresses.insert(from_addr);
+        self.seen_addresses.insert(to_addr);
+
+        // Update holder balances for token holder count tracking
+        // Note: This is a simplified implementation that works correctly for:
+        // - ERC-721: Each transfer is 1 NFT (token_type=1)
+        // - ERC-20/ERC-1155: Requires full balance tracking (not yet implemented)
+        let token_addr = Address::from_slice(&transfer.token_address);
+
+        // For ERC-721, we can track holder changes simply
+        if transfer.token_type == 1 {  // ERC-721
+            // From address loses 1 token
+            let from_key = TokenHolderKey::new(token_addr, from_addr);
+            let from_balance = self.get_or_fetch_balance(&from_key);
+            let new_from_balance = from_balance.saturating_sub(alloy_primitives::U256::from(1));
+            self.update_holder_balance(token_addr, from_addr, new_from_balance, Some(from_balance));
+
+            // To address gains 1 token
+            let to_key = TokenHolderKey::new(token_addr, to_addr);
+            let to_balance = self.get_or_fetch_balance(&to_key);
+            let new_to_balance = to_balance + alloy_primitives::U256::from(1);
+            self.update_holder_balance(token_addr, to_addr, new_to_balance, Some(to_balance));
+        }
+        // For ERC-20 (token_type=0) and ERC-1155 (token_type=2), we need full balance tracking
+        // which requires reading current balances from the database. This is not implemented yet
+        // to avoid performance overhead. Holder counts for these token types will be inaccurate
+        // until we implement a separate balance tracking mechanism.
+
+        self.transfers.push(transfer);
+    }
+
+    /// Get balance from batch cache or fetch from database
+    fn get_or_fetch_balance(&mut self, key: &TokenHolderKey) -> alloy_primitives::U256 {
+        // First check if we've already tracked this balance in the batch
+        if let Some(&balance) = self.batch_balances.get(key) {
+            return balance;
+        }
+
+        // Otherwise, fetch from database
+        let tx = self.env.tx().ok();
+        let balance = if let Some(tx) = tx {
+            let holders_db = tx.inner.open_db(Some(tables::TOKEN_HOLDERS)).ok();
+            if let Some(holders_db) = holders_db {
+                let key_bytes = key.encode();
+                match tx.inner.get::<Vec<u8>>(holders_db.dbi(), key_bytes.as_slice()) {
+                    Ok(Some(bytes)) if bytes.len() >= 32 => {
+                        alloy_primitives::U256::from_be_slice(&bytes[..32])
+                    }
+                    _ => alloy_primitives::U256::ZERO,
+                }
+            } else {
+                alloy_primitives::U256::ZERO
+            }
+        } else {
+            alloy_primitives::U256::ZERO
+        };
+
+        // Cache the balance for future lookups in this batch
+        self.batch_balances.insert(key.clone(), balance);
+        balance
+    }
+
+    /// Update a holder's balance
+    pub fn update_holder_balance(
+        &mut self,
+        token: Address,
+        holder: Address,
+        new_balance: alloy_primitives::U256,
+        old_balance: Option<alloy_primitives::U256>,
+    ) {
+        let key = TokenHolderKey::new(token, holder);
+        self.holder_updates.push((key.clone(), new_balance, old_balance));
+        // Update the batch balance cache so subsequent lookups see the new balance
+        self.batch_balances.insert(key, new_balance);
+    }
+
+    /// Increment a counter
+    pub fn increment_counter(&mut self, name: &[u8], delta: i64) {
+        *self.counter_deltas.entry(name.to_vec()).or_insert(0) += delta;
+    }
+
+    /// Increment an address-specific counter
+    pub fn increment_address_counter(&mut self, address: Address, kind: u8, delta: i64) {
+        let key = AddressCounterKey::new(address, kind);
+        *self.address_counter_deltas.entry(key).or_insert(0) += delta;
+    }
+
+    /// Record a daily metric
+    pub fn record_daily_metric(&mut self, year: u16, month: u8, day: u8, metric: u8, value: i64) {
+        let key = DailyMetricKey::new(year, month, day, metric);
+        self.daily_metrics.push((key, value));
+    }
+
+    /// Record metrics for a block timestamp (extracts date and increments daily counters)
+    pub fn record_block_timestamp(&mut self, timestamp: u64, tx_count: i64, transfer_count: i64) {
+        let dt = chrono::DateTime::from_timestamp(timestamp as i64, 0)
+            .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+        let year = dt.format("%Y").to_string().parse::<u16>().unwrap_or(2024);
+        let month = dt.format("%m").to_string().parse::<u8>().unwrap_or(1);
+        let day = dt.format("%d").to_string().parse::<u8>().unwrap_or(1);
+        // Metric type 0 = TX count, 1 = transfer count
+        self.record_daily_metric(year, month, day, 0, tx_count);
+        self.record_daily_metric(year, month, day, 1, transfer_count);
+    }
+
+    /// Collect all unique addresses from this batch for HLL insertion
+    pub fn collect_addresses(&self) -> impl Iterator<Item = Address> + '_ {
+        // Addresses from transactions
+        let tx_addrs = self.address_txs.iter().map(|(key, _)| key.address());
+
+        // Addresses from transfers (from + to)
+        let transfer_addrs = self.transfers.iter().flat_map(|t| {
+            [Address::from(t.from), Address::from(t.to)]
+        });
+
+        tx_addrs.chain(transfer_addrs)
+    }
+
+    /// Check if batch is getting large (for memory efficiency, not hard limit like FDB)
+    pub fn is_large(&self) -> bool {
+        // MDBX doesn't have FDB's 10MB transaction limit, but we still want to
+        // commit periodically for memory efficiency and progress tracking
+        let total_entries = self.address_txs.len() + self.tx_blocks.len() + self.transfers.len();
+        total_entries > 50_000 // More generous than FDB since no hard limit
+    }
+
+    /// Commit the batch atomically
+    pub fn commit(self, last_block: u64) -> Result<()> {
+        use reth_db_api::transaction::DbTxMut;
+
+        // Get raw mutable transaction
+        let tx = self.env.tx_mut()?;
+
+        // Open or create all our tables, getting the DBI handles
+        let addr_txs_dbi = tx.inner.create_db(Some(tables::ADDRESS_TXS), DatabaseFlags::default())?.dbi();
+        let tx_blocks_dbi = tx.inner.create_db(Some(tables::TX_BLOCKS), DatabaseFlags::default())?.dbi();
+        let addr_transfers_dbi = tx.inner.create_db(Some(tables::ADDRESS_TRANSFERS), DatabaseFlags::default())?.dbi();
+        let token_transfers_dbi = tx.inner.create_db(Some(tables::TOKEN_TRANSFERS), DatabaseFlags::default())?.dbi();
+        let counters_dbi = tx.inner.create_db(Some(tables::COUNTERS), DatabaseFlags::default())?.dbi();
+        let addr_counters_dbi = tx.inner.create_db(Some(tables::ADDRESS_COUNTERS), DatabaseFlags::default())?.dbi();
+        let daily_metrics_dbi = tx.inner.create_db(Some(tables::DAILY_METRICS), DatabaseFlags::default())?.dbi();
+        let metadata_dbi = tx.inner.create_db(Some(tables::METADATA), DatabaseFlags::default())?.dbi();
+
+        // Write address -> tx mappings (using pooled buffers for zero-allocation)
+        for (key, tx_hash) in &self.address_txs {
+            let key_buf = key.encode_pooled();
+            tx.inner.put(addr_txs_dbi, &key_buf[..32], tx_hash.as_slice(), WriteFlags::UPSERT)?;
+            // key_buf returned to pool here via drop
+        }
+
+        // Write tx -> block mappings
+        for (tx_hash, block) in &self.tx_blocks {
+            tx.inner.put(tx_blocks_dbi, tx_hash.as_slice(), &block.to_be_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Write transfers - indexed by both address and token (using pooled buffers)
+        for transfer in &self.transfers {
+            // Serialize transfer
+            let transfer_bytes = bincode::serialize(transfer)
+                .map_err(|e| eyre::eyre!("Failed to serialize transfer: {}", e))?;
+
+            // Index by from address (pooled key encoding)
+            let from_key = AddressTransferKey::new(
+                Address::from(transfer.from),
+                transfer.block_number,
+                transfer.log_index,
+            );
+            let from_key_buf = from_key.encode_pooled();
+            tx.inner.put(addr_transfers_dbi, &from_key_buf[..36], &transfer_bytes, WriteFlags::UPSERT)?;
+
+            // Index by to address (if different)
+            if transfer.from != transfer.to {
+                let to_key = AddressTransferKey::new(
+                    Address::from(transfer.to),
+                    transfer.block_number,
+                    transfer.log_index,
+                );
+                let to_key_buf = to_key.encode_pooled();
+                tx.inner.put(addr_transfers_dbi, &to_key_buf[..36], &transfer_bytes, WriteFlags::UPSERT)?;
+            }
+
+            // Index by token address (pooled key encoding)
+            let token_key = TokenTransferKey::new(
+                Address::from(transfer.token_address),
+                transfer.block_number,
+                transfer.log_index,
+            );
+            let token_key_buf = token_key.encode_pooled();
+            tx.inner.put(token_transfers_dbi, &token_key_buf[..36], &transfer_bytes, WriteFlags::UPSERT)?;
+        }
+
+        // Update counters
+        for (name, delta) in &self.counter_deltas {
+            // Read current value, add delta, write back
+            let current: i64 = match tx.inner.get::<Vec<u8>>(counters_dbi, name.as_slice()) {
+                Ok(Some(bytes)) if bytes.len() >= 8 => {
+                    i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                }
+                _ => 0,
+            };
+            let new_value = current + delta;
+            tx.inner.put(counters_dbi, name.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Update address-specific counters (using pooled buffers)
+        for (key, delta) in &self.address_counter_deltas {
+            let key_buf = key.encode_pooled();
+            let current: i64 = match tx.inner.get::<Vec<u8>>(addr_counters_dbi, &key_buf[..21]) {
+                Ok(Some(bytes)) if bytes.len() >= 8 => {
+                    i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                }
+                _ => 0,
+            };
+            let new_value = current + delta;
+            tx.inner.put(addr_counters_dbi, &key_buf[..21], &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Update daily metrics (using pooled buffers)
+        for (key, value) in &self.daily_metrics {
+            let key_buf = key.encode_pooled();
+            let current: i64 = match tx.inner.get::<Vec<u8>>(daily_metrics_dbi, &key_buf[..5]) {
+                Ok(Some(bytes)) if bytes.len() >= 8 => {
+                    i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                }
+                _ => 0,
+            };
+            let new_value = current + value;
+            tx.inner.put(daily_metrics_dbi, &key_buf[..5], &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+        }
+
+        // Write holder balances and update holder counts
+        if !self.holder_updates.is_empty() {
+            let holders_dbi = tx.inner.create_db(Some(tables::TOKEN_HOLDERS), DatabaseFlags::default())?.dbi();
+            let holder_counts_dbi = tx.inner.create_db(Some(tables::TOKEN_HOLDER_COUNTS), DatabaseFlags::default())?.dbi();
+
+            // Track holder count changes per token
+            let mut holder_count_deltas: std::collections::HashMap<Address, i64> = std::collections::HashMap::new();
+
+            for (key, new_balance, old_balance) in &self.holder_updates {
+                // Use pooled buffer for key encoding
+                let key_buf = key.encode_pooled();
+
+                // Write the balance
+                tx.inner.put(holders_dbi, &key_buf[..40], &new_balance.to_be_bytes::<32>(), WriteFlags::UPSERT)?;
+
+                // Track holder count changes
+                let was_holder = old_balance.map(|b| !b.is_zero()).unwrap_or(false);
+                let is_holder = !new_balance.is_zero();
+
+                if !was_holder && is_holder {
+                    // New holder
+                    *holder_count_deltas.entry(key.token()).or_insert(0) += 1;
+                } else if was_holder && !is_holder {
+                    // Lost holder
+                    *holder_count_deltas.entry(key.token()).or_insert(0) -= 1;
+                }
+            }
+
+            // Update holder counts
+            for (token, delta) in holder_count_deltas {
+                let current: i64 = match tx.inner.get::<Vec<u8>>(holder_counts_dbi, token.as_slice()) {
+                    Ok(Some(bytes)) if bytes.len() >= 8 => {
+                        i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+                    }
+                    _ => 0,
+                };
+                let new_count = (current + delta).max(0);
+                tx.inner.put(holder_counts_dbi, token.as_slice(), &new_count.to_le_bytes(), WriteFlags::UPSERT)?;
+            }
+        }
+
+        // Update last indexed block in metadata
+        tx.inner.put(metadata_dbi, b"last_block", &last_block.to_be_bytes(), WriteFlags::UPSERT)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "reth"))]
+impl MdbxWriteBatch {
+    pub fn insert_address_tx(
+        &mut self,
+        _address: Address,
+        _tx_hash: alloy_primitives::TxHash,
+        _block: u64,
+        _tx_idx: u32,
+    ) {
+    }
+
+    pub fn insert_tx_block(&mut self, _tx_hash: alloy_primitives::TxHash, _block: u64) {
+    }
+
+    pub fn insert_transfer(&mut self, _transfer: TokenTransfer) {
+    }
+
+    pub fn update_holder_balance(
+        &mut self,
+        _token: Address,
+        _holder: Address,
+        _new_balance: alloy_primitives::U256,
+        _old_balance: Option<alloy_primitives::U256>,
+    ) {
+    }
+
+    pub fn increment_counter(&mut self, _name: &[u8], _delta: i64) {
+    }
+
+    pub fn increment_address_counter(&mut self, _address: Address, _kind: u8, _delta: i64) {
+    }
+
+    pub fn record_daily_metric(&mut self, _year: u16, _month: u8, _day: u8, _metric: u8, _value: i64) {
+    }
+
+    pub fn record_block_timestamp(&mut self, _timestamp: u64, _tx_count: i64, _transfer_count: i64) {
+    }
+
+    pub fn collect_addresses(&self) -> impl Iterator<Item = Address> + '_ {
+        std::iter::empty()
+    }
+
+    pub fn is_large(&self) -> bool {
+        false
+    }
+
+    pub fn commit(self, _last_block: u64) -> Result<()> {
+        Err(eyre::eyre!("MDBX support requires 'reth' feature"))
+    }
+}
+
+// ============================================================================
+// IndexDatabase Trait Implementation (Task 4.3)
+// ============================================================================
+
+use async_trait::async_trait;
+use crate::index_trait::IndexDatabase;
+
+#[cfg(feature = "reth")]
+#[async_trait]
+impl IndexDatabase for MdbxIndex {
+    async fn last_indexed_block(&self) -> Result<Option<u64>> {
+        // MDBX is sync, but we're already calling it directly (no blocking needed for simple reads)
+        self.get_last_indexed_block()
+    }
+
+    async fn get_address_txs(
+        &self,
+        address: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<alloy_primitives::TxHash>> {
+        self.get_address_txs(address, limit, offset)
+    }
+
+    async fn get_address_transfers(
+        &self,
+        address: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::index_trait::TokenTransfer>> {
+        // TokenTransfer is already the same type (re-exported from index_trait)
+        self.get_address_transfers(address, limit, offset)
+    }
+
+    async fn get_token_holders(
+        &self,
+        token: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(Address, alloy_primitives::U256)>> {
+        self.get_token_holders(token, limit, offset)
+    }
+
+    async fn get_token_transfers(
+        &self,
+        token: &Address,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::index_trait::TokenTransfer>> {
+        // TokenTransfer is already the same type (re-exported from index_trait)
+        self.get_token_transfers(token, limit, offset)
+    }
+
+    async fn get_tx_block(&self, tx_hash: &alloy_primitives::TxHash) -> Result<Option<u64>> {
+        self.get_tx_block(tx_hash)
+    }
+
+    async fn get_total_txs(&self) -> Result<u64> {
+        self.get_total_txs()
+    }
+
+    async fn get_total_addresses(&self) -> Result<u64> {
+        self.get_total_addresses()
+    }
+
+    async fn get_total_transfers(&self) -> Result<u64> {
+        self.get_total_transfers()
+    }
+
+    async fn get_address_tx_count(&self, address: &Address) -> Result<u64> {
+        // MDBX returns i64, convert to u64
+        let count = self.get_address_counter(address, 0)?; // 0 = TX counter
+        Ok(count as u64)
+    }
+
+    async fn get_address_transfer_count(&self, address: &Address) -> Result<u64> {
+        // MDBX returns i64, convert to u64
+        let count = self.get_address_counter(address, 1)?; // 1 = TOKEN_TRANSFER counter
+        Ok(count as u64)
+    }
+
+    async fn get_token_holder_count(&self, token: &Address) -> Result<u64> {
+        // MDBX returns i64, convert to u64
+        let count = self.get_token_holder_count(token)?;
+        Ok(count as u64)
+    }
+
+    async fn get_daily_tx_metrics(&self, _days: usize) -> Result<Vec<(String, u64)>> {
+        // Placeholder - MDBX doesn't implement this yet
+        // Return empty vec for now
+        Ok(vec![])
+    }
+
+    async fn get_all_tokens(&self, limit: usize, offset: usize) -> Result<Vec<(Address, u64)>> {
+        let tx = self.env.tx()?;
+
+        let holder_counts_db = match tx.inner.open_db(Some(tables::TOKEN_HOLDER_COUNTS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(vec![]), // Table doesn't exist yet
+        };
+
+        let mut cursor = tx.inner.cursor(&holder_counts_db)?;
+
+        // Collect all tokens with their holder counts
+        let mut tokens: Vec<(Address, u64)> = Vec::new();
+        for result in cursor.iter::<Vec<u8>, Vec<u8>>() {
+            let (key, value) = result?;
+            if key.len() == 20 && value.len() == 8 {
+                let addr = Address::from_slice(&key);
+                let count = i64::from_le_bytes(value[..8].try_into().unwrap_or([0u8; 8])) as u64;
+                tokens.push((addr, count));
+            }
+        }
+
+        // Sort by holder count descending
+        tokens.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Apply pagination
+        Ok(tokens.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn get_top_addresses(&self, limit: usize, offset: usize) -> Result<Vec<(Address, u64)>> {
+        let tx = self.env.tx()?;
+
+        let addr_counters_db = match tx.inner.open_db(Some(tables::ADDRESS_COUNTERS)) {
+            Ok(db) => db,
+            Err(_) => return Ok(vec![]), // Table doesn't exist yet
+        };
+
+        let mut cursor = tx.inner.cursor(&addr_counters_db)?;
+
+        // Collect all addresses with their tx counts (kind=0 means TX counter)
+        // Key format: address[20] + kind[1]
+        let mut addresses: Vec<(Address, u64)> = Vec::new();
+        for result in cursor.iter::<Vec<u8>, Vec<u8>>() {
+            let (key, value) = result?;
+            // We only want TX counters (kind = 0), key is 21 bytes: addr[20] + kind[1]
+            if key.len() == 21 && key[20] == 0 && value.len() == 8 {
+                let addr = Address::from_slice(&key[..20]);
+                let count = i64::from_le_bytes(value[..8].try_into().unwrap_or([0u8; 8])) as u64;
+                addresses.push((addr, count));
+            }
+        }
+
+        // Sort by tx count descending
+        addresses.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Apply pagination
+        Ok(addresses.into_iter().skip(offset).take(limit).collect())
+    }
+}

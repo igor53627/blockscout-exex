@@ -1,6 +1,6 @@
 # blockscout-exex
 
-A high-performance Blockscout-compatible API server that reads directly from Reth's database — no JSON-RPC overhead. Uses FoundationDB for scalable indexed data storage and Meilisearch for full-text search.
+A high-performance Blockscout-compatible API server that reads directly from Reth's database — no JSON-RPC overhead. Uses MDBX for fast indexed data storage and Meilisearch for full-text search.
 
 ## Architecture
 
@@ -9,7 +9,7 @@ A high-performance Blockscout-compatible API server that reads directly from Ret
 │   Blockscout    │────▶│              blockscout-exex API                      │
 │    Frontend     │     │                                                       │
 │    (Next.js)    │     │  ┌─────────────────┐  ┌────────────┐  ┌────────────┐  │
-└─────────────────┘     │  │  FoundationDB   │  │ Meilisearch│  │ Reth/RPC   │  │
+└─────────────────┘     │  │      MDBX       │  │ Meilisearch│  │ Reth/RPC   │  │
                         │  │                 │  │            │  │            │  │
                         │  │  • addr → txs   │  │  • tokens  │  │  • blocks  │  │
                         │  │  • addr → xfers │  │  • addrs   │  │  • txs     │  │
@@ -25,13 +25,13 @@ A high-performance Blockscout-compatible API server that reads directly from Ret
 | Component | Status | Notes |
 |-----------|--------|-------|
 | **API Server** | ✅ Working | Serves Blockscout v2 API |
-| **FDB Integration** | ✅ Working | TCP connection to fdbserver |
+| **MDBX Integration** | ✅ Working | Embedded key-value database |
 | **Meilisearch** | ✅ Working | Full-text search for tokens/addresses |
-| **Backfill Tool** | ✅ Working | Indexes from JSON-RPC + populates Meilisearch |
+| **Backfill Tool** | ✅ Working | Indexes from Reth DB + populates Meilisearch |
 | **WebSocket** | ✅ Working | Phoenix Channels compatible for live updates |
-| **Reth Direct Reads** | ✅ Working | Optional, requires `--features reth` |
+| **Reth Direct Reads** | ✅ Working | Requires `--features reth` |
 
-## FDB Key Schema
+## MDBX Key Schema
 
 ```
 Prefix  Key Layout                              Value
@@ -58,20 +58,20 @@ Prefix  Key Layout                              Value
 
 | Endpoint | Source |
 |----------|--------|
-| `GET /api/v2/addresses/:hash/transactions` | FDB |
-| `GET /api/v2/addresses/:hash/token-transfers` | FDB |
-| `GET /api/v2/addresses/:hash/counters` | FDB |
-| `GET /api/v2/addresses/:hash/tabs-counters` | FDB |
+| `GET /api/v2/addresses/:hash/transactions` | MDBX |
+| `GET /api/v2/addresses/:hash/token-transfers` | MDBX |
+| `GET /api/v2/addresses/:hash/counters` | MDBX |
+| `GET /api/v2/addresses/:hash/tabs-counters` | MDBX |
 | `GET /api/v2/tokens/:hash` | RPC eth_call |
-| `GET /api/v2/tokens/:hash/holders` | FDB |
-| `GET /api/v2/tokens/:hash/transfers` | FDB |
-| `GET /api/v2/tokens/:hash/counters` | FDB |
+| `GET /api/v2/tokens/:hash/holders` | MDBX |
+| `GET /api/v2/tokens/:hash/transfers` | MDBX |
+| `GET /api/v2/tokens/:hash/counters` | MDBX |
 | `GET /api/v2/transactions/:hash/logs` | RPC receipt |
 | `GET /api/v2/transactions/:hash/token-transfers` | RPC receipt |
 | `GET /api/v2/transactions/:hash/internal-transactions` | RPC trace |
 | `GET /api/v2/blocks`, `/blocks/:id`, `/blocks/:id/transactions` | RPC |
-| `GET /api/v2/search`, `/search/quick` | Meilisearch + FDB |
-| `GET /api/v2/stats` | FDB counters |
+| `GET /api/v2/search`, `/search/quick` | Meilisearch + MDBX |
+| `GET /api/v2/stats` | MDBX counters |
 | `GET /socket/v2/websocket` | Phoenix Channels |
 
 ### Stubbed (Frontend Compatibility)
@@ -84,7 +84,7 @@ Prefix  Key Layout                              Value
 
 ```bash
 blockscout-api [OPTIONS]
-    --cluster-file <PATH>     FDB cluster file
+    --mdbx-path <PATH>        MDBX database path
     --port <PORT>             [default: 3000]
     --host <HOST>             [default: 0.0.0.0]
     --socket <PATH>           Unix socket for SSR
@@ -98,12 +98,13 @@ blockscout-api [OPTIONS]
 
 ```bash
 blockscout-backfill [OPTIONS]
-    --rpc-url <URL>           [default: http://localhost:8545]
-    --ipc-path <PATH>         Unix socket (faster than HTTP)
-    --cluster-file <PATH>     FDB cluster file
+    --reth-db <PATH>          Reth database path
+    --reth-static-files <PATH> Reth static files path
+    --mdbx-path <PATH>        MDBX database path
     --from-block <NUM>        [default: 0 = resume]
     --to-block <NUM>          [default: 0 = latest]
     --batch-size <NUM>        [default: 1000]
+    --chain <NAME>            Chain name [default: sepolia]
     --meili-url <URL>         Meilisearch URL (enables token indexing)
     --meili-key <KEY>         Meilisearch API key
 ```
@@ -112,16 +113,8 @@ blockscout-backfill [OPTIONS]
 
 ### 1. Prerequisites
 
-**FoundationDB:**
-```bash
-# macOS
-brew install foundationdb
-
-# Ubuntu/Debian
-curl -LO https://github.com/apple/foundationdb/releases/download/7.3.43/foundationdb-clients_7.3.43-1_amd64.deb
-curl -LO https://github.com/apple/foundationdb/releases/download/7.3.43/foundationdb-server_7.3.43-1_amd64.deb
-sudo dpkg -i foundationdb-*.deb
-```
+**Reth Node:**
+Requires a running Reth node with accessible database for backfill.
 
 **Meilisearch:**
 ```bash
@@ -133,22 +126,25 @@ docker run -d --name meilisearch -p 7700:7700 \
 ### 2. Build
 
 ```bash
-cargo build --release
+cargo build --release --features reth
 ```
 
 ### 3. Backfill Index
 
 ```bash
 ./target/release/blockscout-backfill \
-  --rpc-url https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY \
-  --meili-url http://localhost:7700 \
-  --from-block 0
+  --reth-db /path/to/reth/db \
+  --reth-static-files /path/to/reth/static_files \
+  --mdbx-path /path/to/mdbx \
+  --chain sepolia \
+  --meili-url http://localhost:7700
 ```
 
 ### 4. Start API
 
 ```bash
 ./target/release/blockscout-api \
+  --mdbx-path /path/to/mdbx \
   --port 4000 \
   --reth-rpc http://localhost:8545 \
   --meili-url http://localhost:7700 \
@@ -160,10 +156,11 @@ cargo build --release
 | Operation | Latency |
 |-----------|---------|
 | Block by number (RPC) | ~5-10ms |
-| Address transactions (FDB) | ~1ms |
-| Token holders (FDB) | ~1ms |
+| Address transactions (MDBX) | ~1ms |
+| Token holders (MDBX) | ~1ms |
 | Search (Meilisearch) | ~5ms |
-| Counter read (FDB) | ~0.5ms |
+| Counter read (MDBX) | ~0.5ms |
+| Backfill speed | ~100 blocks/sec |
 
 ## License
 
