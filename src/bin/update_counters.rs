@@ -3,8 +3,10 @@
 //! Run this after backfill completes to populate:
 //! - total_blocks (from IndexingStatus)
 //! - total_txs (count from TxBlocks table)
-//! - total_addresses (count unique addresses)
-//! - total_transfers (count from TokenTransfers)
+//! - total_addresses (count from AddressCounters table - O(1) via stat)
+//! - total_transfers (count from TokenTransfers table)
+//!
+//! Uses db.stat() for O(1) entry counts instead of iterating.
 
 use std::path::PathBuf;
 use clap::Parser;
@@ -32,11 +34,11 @@ async fn main() -> Result<()> {
     {
         use reth_libmdbx::{Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode, DatabaseFlags, WriteFlags};
 
-        // Open in read-write mode
+        // Open in read-write mode with longer timeout
         let env = Environment::builder()
             .set_geometry(Geometry {
-                size: Some(0..(1024 * 1024 * 1024 * 1024)), // 1TB max
-                growth_step: Some(1024 * 1024 * 1024),      // 1GB growth
+                size: Some(0..(2 * 1024 * 1024 * 1024 * 1024)), // 2TB max
+                growth_step: Some(1024 * 1024 * 1024),          // 1GB growth
                 shrink_threshold: None,
                 page_size: Some(PageSize::Set(4096)),
             })
@@ -49,66 +51,27 @@ async fn main() -> Result<()> {
             .set_max_dbs(20)
             .open(&args.mdbx_path)?;
 
-        info!("Counting entries in tables...");
+        info!("Getting entry counts via stat() - O(1) operation...");
 
         let txn = env.begin_ro_txn()?;
 
-        // Count TxBlocks entries (total transactions)
+        // Use stat() for O(1) entry counts
         let tx_blocks_db = txn.open_db(Some("TxBlocks"))?;
-        let mut tx_count: u64 = 0;
-        {
-            let mut cursor = txn.cursor(&tx_blocks_db)?;
-            while cursor.next::<(), ()>()?.is_some() {
-                tx_count += 1;
-                if tx_count % 1_000_000 == 0 {
-                    info!("  Counted {} txs...", tx_count);
-                }
-            }
-        }
-        info!("Total transactions: {}", tx_count);
+        let tx_stat = txn.db_stat(&tx_blocks_db)?;
+        let tx_count = tx_stat.entries() as u64;
+        info!("Total transactions (TxBlocks entries): {}", tx_count);
 
-        // Count unique addresses from AddressTxs
-        let addr_txs_db = txn.open_db(Some("AddressTxs"))?;
-        let mut last_addr: Option<[u8; 20]> = None;
-        let mut addr_count: u64 = 0;
-        {
-            let mut cursor = txn.cursor(&addr_txs_db)?;
-            // Position at first entry
-            if cursor.first::<(), ()>()?.is_some() {
-                loop {
-                    if let Some((key, _)) = cursor.get_current::<Vec<u8>, Vec<u8>>()? {
-                        if key.len() >= 20 {
-                            let addr: [u8; 20] = key[0..20].try_into().unwrap_or([0u8; 20]);
-                            if last_addr.as_ref() != Some(&addr) {
-                                addr_count += 1;
-                                last_addr = Some(addr);
-                                if addr_count % 100_000 == 0 {
-                                    info!("  Counted {} addresses...", addr_count);
-                                }
-                            }
-                        }
-                    }
-                    if cursor.next::<(), ()>()?.is_none() {
-                        break;
-                    }
-                }
-            }
-        }
-        info!("Total addresses: {}", addr_count);
+        // AddressCounters has one entry per unique address
+        let addr_counters_db = txn.open_db(Some("AddressCounters"))?;
+        let addr_stat = txn.db_stat(&addr_counters_db)?;
+        let addr_count = addr_stat.entries() as u64;
+        info!("Total addresses (AddressCounters entries): {}", addr_count);
 
-        // Count transfers
+        // TokenTransfers count
         let transfers_db = txn.open_db(Some("TokenTransfers"))?;
-        let mut transfer_count: u64 = 0;
-        {
-            let mut cursor = txn.cursor(&transfers_db)?;
-            while cursor.next::<(), ()>()?.is_some() {
-                transfer_count += 1;
-                if transfer_count % 1_000_000 == 0 {
-                    info!("  Counted {} transfers...", transfer_count);
-                }
-            }
-        }
-        info!("Total transfers: {}", transfer_count);
+        let transfer_stat = txn.db_stat(&transfers_db)?;
+        let transfer_count = transfer_stat.entries() as u64;
+        info!("Total transfers (TokenTransfers entries): {}", transfer_count);
 
         // Get last indexed block from Metadata
         let meta_db = txn.open_db(Some("Metadata"))?;
