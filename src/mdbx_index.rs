@@ -505,7 +505,7 @@ impl MdbxIndex {
 
         let args = DatabaseArguments::new(ClientVersion::default())
             .with_max_readers(Some(256))
-            .with_geometry_max_size(Some(1024 * GIGABYTE));
+            .with_geometry_max_size(Some(1536 * GIGABYTE));  // 1.5TB - must match write mode
 
         let env = DatabaseEnv::open(path, DatabaseEnvKind::RO, args)?;
 
