@@ -43,6 +43,9 @@ use std::hash::Hash;
 use eyre::Result;
 use alloy_primitives::Address;
 
+// Import buffer pool for zero-allocation key encoding
+use crate::buffer_pool::{get_buffer, BufferGuard};
+
 // Re-export TokenTransfer from index_trait for compatibility
 pub use crate::index_trait::TokenTransfer;
 
@@ -145,6 +148,25 @@ impl AddressTxKey {
             tx_idx,
         })
     }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    /// Returns a BufferGuard that auto-returns to pool on drop
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.address.as_slice());
+        buf.extend_from_slice(&self.block.to_be_bytes());
+        buf.extend_from_slice(&self.tx_idx.to_be_bytes());
+        buf
+    }
+
+    /// Encode just the address prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(address: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(address.as_slice());
+        buf
+    }
 }
 
 /// Key for address -> transfer mappings: (address, block, log_idx)
@@ -200,6 +222,24 @@ impl AddressTransferKey {
             log_idx,
         })
     }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.address.as_slice());
+        buf.extend_from_slice(&self.block.to_be_bytes());
+        buf.extend_from_slice(&self.log_idx.to_be_bytes());
+        buf
+    }
+
+    /// Encode just the address prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(address: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(address.as_slice());
+        buf
+    }
 }
 
 /// Key for token holder mappings: (token, holder)
@@ -240,6 +280,23 @@ impl TokenHolderKey {
         let holder = Address::from_slice(&bytes[20..40]);
         Ok(Self { token, holder })
     }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.token.as_slice());
+        buf.extend_from_slice(self.holder.as_slice());
+        buf
+    }
+
+    /// Encode just the token prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(token: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(token.as_slice());
+        buf
+    }
 }
 
 impl TokenTransferKey {
@@ -276,6 +333,24 @@ impl TokenTransferKey {
         let log_idx = u64::from_be_bytes(bytes[28..36].try_into()?);
         Ok(Self { token, block, log_idx })
     }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.token.as_slice());
+        buf.extend_from_slice(&self.block.to_be_bytes());
+        buf.extend_from_slice(&self.log_idx.to_be_bytes());
+        buf
+    }
+
+    /// Encode just the token prefix into a pooled buffer (for range scans)
+    pub fn encode_prefix_pooled(token: &Address) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(token.as_slice());
+        buf
+    }
 }
 
 impl AddressCounterKey {
@@ -305,6 +380,15 @@ impl AddressCounterKey {
         let address = Address::from_slice(&bytes[0..20]);
         let kind = bytes[20];
         Ok(Self { address, kind })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(self.address.as_slice());
+        buf.push(self.kind);
+        buf
     }
 }
 
@@ -347,6 +431,17 @@ impl DailyMetricKey {
         let day = bytes[3];
         let metric = bytes[4];
         Ok(Self { year, month, day, metric })
+    }
+
+    /// Encode key into a pooled buffer (zero-allocation)
+    pub fn encode_pooled(&self) -> BufferGuard<'static> {
+        let mut buf = get_buffer();
+        buf.clear();
+        buf.extend_from_slice(&self.year.to_be_bytes());
+        buf.push(self.month);
+        buf.push(self.day);
+        buf.push(self.metric);
+        buf
     }
 }
 
@@ -1317,9 +1412,11 @@ impl MdbxWriteBatch {
         let daily_metrics_dbi = tx.inner.create_db(Some(tables::DAILY_METRICS), DatabaseFlags::default())?.dbi();
         let metadata_dbi = tx.inner.create_db(Some(tables::METADATA), DatabaseFlags::default())?.dbi();
 
-        // Write address -> tx mappings
+        // Write address -> tx mappings (using pooled buffers for zero-allocation)
         for (key, tx_hash) in &self.address_txs {
-            tx.inner.put(addr_txs_dbi, key.encode(), tx_hash.as_slice(), WriteFlags::UPSERT)?;
+            let key_buf = key.encode_pooled();
+            tx.inner.put(addr_txs_dbi, &key_buf[..32], tx_hash.as_slice(), WriteFlags::UPSERT)?;
+            // key_buf returned to pool here via drop
         }
 
         // Write tx -> block mappings
@@ -1327,19 +1424,20 @@ impl MdbxWriteBatch {
             tx.inner.put(tx_blocks_dbi, tx_hash.as_slice(), &block.to_be_bytes(), WriteFlags::UPSERT)?;
         }
 
-        // Write transfers - indexed by both address and token
+        // Write transfers - indexed by both address and token (using pooled buffers)
         for transfer in &self.transfers {
             // Serialize transfer
             let transfer_bytes = bincode::serialize(transfer)
                 .map_err(|e| eyre::eyre!("Failed to serialize transfer: {}", e))?;
 
-            // Index by from address
+            // Index by from address (pooled key encoding)
             let from_key = AddressTransferKey::new(
                 Address::from(transfer.from),
                 transfer.block_number,
                 transfer.log_index,
             );
-            tx.inner.put(addr_transfers_dbi, from_key.encode(), &transfer_bytes, WriteFlags::UPSERT)?;
+            let from_key_buf = from_key.encode_pooled();
+            tx.inner.put(addr_transfers_dbi, &from_key_buf[..36], &transfer_bytes, WriteFlags::UPSERT)?;
 
             // Index by to address (if different)
             if transfer.from != transfer.to {
@@ -1348,16 +1446,18 @@ impl MdbxWriteBatch {
                     transfer.block_number,
                     transfer.log_index,
                 );
-                tx.inner.put(addr_transfers_dbi, to_key.encode(), &transfer_bytes, WriteFlags::UPSERT)?;
+                let to_key_buf = to_key.encode_pooled();
+                tx.inner.put(addr_transfers_dbi, &to_key_buf[..36], &transfer_bytes, WriteFlags::UPSERT)?;
             }
 
-            // Index by token address
+            // Index by token address (pooled key encoding)
             let token_key = TokenTransferKey::new(
                 Address::from(transfer.token_address),
                 transfer.block_number,
                 transfer.log_index,
             );
-            tx.inner.put(token_transfers_dbi, token_key.encode(), &transfer_bytes, WriteFlags::UPSERT)?;
+            let token_key_buf = token_key.encode_pooled();
+            tx.inner.put(token_transfers_dbi, &token_key_buf[..36], &transfer_bytes, WriteFlags::UPSERT)?;
         }
 
         // Update counters
@@ -1373,30 +1473,30 @@ impl MdbxWriteBatch {
             tx.inner.put(counters_dbi, name.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
         }
 
-        // Update address-specific counters
+        // Update address-specific counters (using pooled buffers)
         for (key, delta) in &self.address_counter_deltas {
-            let key_bytes = key.encode();
-            let current: i64 = match tx.inner.get::<Vec<u8>>(addr_counters_dbi, key_bytes.as_slice()) {
+            let key_buf = key.encode_pooled();
+            let current: i64 = match tx.inner.get::<Vec<u8>>(addr_counters_dbi, &key_buf[..21]) {
                 Ok(Some(bytes)) if bytes.len() >= 8 => {
                     i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
                 }
                 _ => 0,
             };
             let new_value = current + delta;
-            tx.inner.put(addr_counters_dbi, key_bytes.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+            tx.inner.put(addr_counters_dbi, &key_buf[..21], &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
         }
 
-        // Update daily metrics
+        // Update daily metrics (using pooled buffers)
         for (key, value) in &self.daily_metrics {
-            let key_bytes = key.encode();
-            let current: i64 = match tx.inner.get::<Vec<u8>>(daily_metrics_dbi, key_bytes.as_slice()) {
+            let key_buf = key.encode_pooled();
+            let current: i64 = match tx.inner.get::<Vec<u8>>(daily_metrics_dbi, &key_buf[..5]) {
                 Ok(Some(bytes)) if bytes.len() >= 8 => {
                     i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
                 }
                 _ => 0,
             };
             let new_value = current + value;
-            tx.inner.put(daily_metrics_dbi, key_bytes.as_slice(), &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
+            tx.inner.put(daily_metrics_dbi, &key_buf[..5], &new_value.to_le_bytes(), WriteFlags::UPSERT)?;
         }
 
         // Write holder balances and update holder counts
@@ -1408,10 +1508,11 @@ impl MdbxWriteBatch {
             let mut holder_count_deltas: std::collections::HashMap<Address, i64> = std::collections::HashMap::new();
 
             for (key, new_balance, old_balance) in &self.holder_updates {
-                let key_bytes = key.encode();
+                // Use pooled buffer for key encoding
+                let key_buf = key.encode_pooled();
 
                 // Write the balance
-                tx.inner.put(holders_dbi, key_bytes.as_slice(), &new_balance.to_be_bytes::<32>(), WriteFlags::UPSERT)?;
+                tx.inner.put(holders_dbi, &key_buf[..40], &new_balance.to_be_bytes::<32>(), WriteFlags::UPSERT)?;
 
                 // Track holder count changes
                 let was_holder = old_balance.map(|b| !b.is_zero()).unwrap_or(false);
