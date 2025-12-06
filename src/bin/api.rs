@@ -295,6 +295,7 @@ fn format_block_for_ws(block: &serde_json::Value) -> serde_json::Value {
             "height": number_dec,
             "timestamp": ts,
             "tx_count": tx_count,
+            "transactions_count": tx_count,
             "miner": {
                 "hash": miner,
                 "implementations": null,
