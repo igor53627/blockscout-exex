@@ -61,11 +61,39 @@ async fn main() -> Result<()> {
         let tx_count = tx_stat.entries() as u64;
         info!("Total transactions (TxBlocks entries): {}", tx_count);
 
-        // AddressCounters has one entry per unique address
-        let addr_counters_db = txn.open_db(Some("AddressCounters"))?;
-        let addr_stat = txn.db_stat(&addr_counters_db)?;
-        let addr_count = addr_stat.entries() as u64;
-        info!("Total addresses (AddressCounters entries): {}", addr_count);
+        // Count unique addresses from AddressTxs (keys are: address[20] + block[8] + tx_idx[4])
+        // We iterate and count distinct address prefixes
+        let addr_txs_db = txn.open_db(Some("AddressTxs"))?;
+        let addr_txs_stat = txn.db_stat(&addr_txs_db)?;
+        info!("AddressTxs has {} entries, counting unique addresses...", addr_txs_stat.entries());
+
+        let addr_count: u64 = {
+            let mut cursor = txn.cursor(&addr_txs_db)?;
+            let mut count = 0u64;
+            let mut last_addr: Option<[u8; 20]> = None;
+
+            if cursor.first::<(), ()>()?.is_some() {
+                loop {
+                    if let Some((key, _)) = cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                        if key.len() >= 20 {
+                            let addr: [u8; 20] = key[0..20].try_into().unwrap_or([0u8; 20]);
+                            if last_addr.as_ref() != Some(&addr) {
+                                count += 1;
+                                last_addr = Some(addr);
+                                if count % 500_000 == 0 {
+                                    info!("  Counted {} unique addresses...", count);
+                                }
+                            }
+                        }
+                    }
+                    if cursor.next::<(), ()>()?.is_none() {
+                        break;
+                    }
+                }
+            }
+            count
+        };
+        info!("Total unique addresses: {}", addr_count);
 
         // TokenTransfers count
         let transfers_db = txn.open_db(Some("TokenTransfers"))?;
