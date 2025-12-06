@@ -206,14 +206,23 @@ async fn block_watcher(reth_rpc: String, tx: Broadcaster) {
                             }
                         }
 
-                        // Send indexing status
+                        // Send indexing status for blocks
                         let _ = tx.send(BroadcastMessage {
                             topic: "blocks:indexing".to_string(),
                             event: "index_status".to_string(),
                             payload: json!({
-                                "finished_indexing": true,
-                                "indexed_blocks_ratio": "1.00",
-                                "indexed_internal_transactions_ratio": "1.00"
+                                "finished": true,
+                                "ratio": "1.00"
+                            }),
+                        });
+
+                        // Send indexing status for internal transactions
+                        let _ = tx.send(BroadcastMessage {
+                            topic: "blocks:indexing_internal_transactions".to_string(),
+                            event: "index_status".to_string(),
+                            payload: json!({
+                                "finished": true,
+                                "ratio": "1.00"
                             }),
                         });
                     }

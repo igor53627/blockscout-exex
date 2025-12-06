@@ -1,0 +1,534 @@
+# Product Requirements Document: FDB to MDBX Migration + Monad Optimizations
+# GitHub Issue: https://github.com/igor53627/blockscout-exex/issues/2
+
+## Overview
+Migrate blockscout-exex from FoundationDB to an embedded MDBX database while implementing
+performance enhancements based on Monad L1 research. This project requires Test-Driven
+Development (TDD) methodology for all implementations.
+
+## Project Context
+- **Current State**: FoundationDB-based indexer with ~11 blocks/sec backfill, 2+ hour recovery
+- **Target State**: MDBX embedded database with ~100 blocks/sec backfill, <1 minute recovery
+- **Codebase**: Rust project using Reth MDBX patterns, Tokio async runtime, Axum API server
+- **Remote Server**: root@aya (SSH access available for deployment testing)
+
+## Success Metrics
+| Metric | Current | Target |
+|--------|---------|--------|
+| Backfill Speed | ~11 blocks/sec | ~100 blocks/sec |
+| Recovery Time | 2+ hours | <1 minute |
+| API p99 Latency | TBD | <50ms |
+| Memory Management | Unbounded | Byte-tracked |
+
+---
+
+# PHASE 1: MDBX Core Migration (High Priority)
+
+## Task 1.1: Create MDBX Index Module Foundation
+**Description**: Create the `mdbx_index.rs` module with database environment setup, schema versioning,
+and basic CRUD operations following Reth MDBX patterns.
+
+**Requirements**:
+- Create `src/mdbx_index.rs` with `MdbxIndex` struct parallel to `FdbIndex`
+- Implement schema versioning in Metadata table
+- Use `reth-db` MDBX bindings (already in dependencies)
+- Support both read-only and read-write transaction modes
+- Environment configuration: max readers, map size, sync modes
+
+**Technical Details**:
+- Reference Reth's `reth-db` crate patterns for MDBX usage
+- Environment flags: `NOSUBDIR`, `WRITEMAP`, `MAPASYNC` for performance
+- Map size: Start with 256GB, auto-grow capability
+- Max readers: 256 concurrent readers
+
+**TDD Requirements**:
+- Unit tests for database open/close lifecycle
+- Unit tests for schema version detection and migration
+- Integration tests for transaction commit/abort
+- Tests for environment recovery after crash
+
+**Files to Create**:
+- `src/mdbx_index.rs` (new)
+- `tests/mdbx_index_test.rs` (new)
+
+---
+
+## Task 1.2: Define MDBX Table Schema
+**Description**: Define all six MDBX tables with proper key encoding and value serialization.
+
+**Requirements**:
+Create tables matching current FDB schema:
+1. `AddressTxs` - `(address, block, tx_idx) -> tx_hash`
+2. `AddressTransfers` - `(address, block, log_idx) -> TokenTransfer`
+3. `TokenHolders` - `(token, holder) -> balance`
+4. `TxBlocks` - `tx_hash -> block_number`
+5. `TokenTransfers` - `(token, block, log_idx) -> TokenTransfer`
+6. `Metadata` - `key -> value` (version, block height, counters)
+
+**Technical Details**:
+- Use `reth-db-api` table traits for type-safe table definitions
+- Implement custom `Encode`/`Decode` traits for composite keys
+- Use `bincode` for value serialization (consistent with current FDB impl)
+- Big-endian encoding for numeric keys (lexicographic ordering)
+
+**TDD Requirements**:
+- Unit tests for key encoding/decoding roundtrips
+- Unit tests for value serialization/deserialization
+- Tests for lexicographic key ordering
+- Property-based tests for edge cases (zero values, max values)
+
+**Files to Modify/Create**:
+- `src/mdbx_index.rs` (table definitions)
+- `src/tables.rs` (new - table type definitions)
+
+---
+
+## Task 1.3: Implement Write Operations
+**Description**: Implement `WriteBatch` equivalent for MDBX with all insert/update operations.
+
+**Requirements**:
+- Create `MdbxWriteBatch` struct with deferred commit pattern
+- Implement methods:
+  - `insert_address_tx(address, tx_hash, block, tx_idx)`
+  - `insert_transfer(TokenTransfer)`
+  - `update_holder_balance(token, holder, balance, old_balance)`
+  - `increment_counter(name, delta)`
+  - `commit(last_block)` with atomic write
+- Handle ERC-20, ERC-721, ERC-1155 token transfers
+- Support bulk inserts with configurable commit threshold
+
+**Technical Details**:
+- No chunking needed (MDBX handles large transactions better than FDB)
+- Use cursor-based bulk inserts for performance
+- Track dirty keys for rollback support
+- Implement counter updates via read-modify-write pattern
+
+**TDD Requirements**:
+- Unit tests for each insert method
+- Integration tests for batch commit atomicity
+- Tests for counter increment concurrency
+- Tests for rollback on failure
+- Performance benchmarks vs FDB WriteBatch
+
+**Files to Modify**:
+- `src/mdbx_index.rs`
+
+---
+
+## Task 1.4: Implement Read Operations
+**Description**: Implement all query operations with pagination and range scans.
+
+**Requirements**:
+- Implement async methods matching `FdbIndex` interface:
+  - `last_indexed_block() -> Option<u64>`
+  - `get_address_txs(address, limit, offset) -> Vec<TxRecord>`
+  - `get_address_transfers(address, limit, offset) -> Vec<TokenTransfer>`
+  - `get_token_holders(token, limit, offset) -> Vec<HolderRecord>`
+  - `get_token_transfers(token, limit, offset) -> Vec<TokenTransfer>`
+  - `get_tx_block(tx_hash) -> Option<u64>`
+  - `get_total_txs/transfers/addresses() -> u64`
+  - `get_address_tx_count(address) -> u64`
+
+**Technical Details**:
+- Use cursor-based iteration for range queries
+- Implement efficient skip-to-offset for pagination
+- Support reverse iteration (most recent first)
+- Read-only transactions for queries
+
+**TDD Requirements**:
+- Unit tests for each query method
+- Tests for pagination edge cases (empty, partial, exact)
+- Tests for reverse ordering
+- Tests for concurrent read operations
+- Performance benchmarks vs FDB reads
+
+**Files to Modify**:
+- `src/mdbx_index.rs`
+
+---
+
+## Task 1.5: Create Database Abstraction Trait
+**Description**: Create a trait that abstracts database operations, allowing API to work with both FDB and MDBX.
+
+**Requirements**:
+- Define `IndexDatabase` trait with all read methods
+- Implement trait for both `FdbIndex` and `MdbxIndex`
+- Update `ApiState` to use `Arc<dyn IndexDatabase>`
+- Feature flags: `fdb` (default) and `mdbx` for compilation
+
+**Technical Details**:
+- Use async_trait for async trait methods
+- Keep backward compatibility with FDB
+- Gradual migration path via feature flags
+
+**TDD Requirements**:
+- Tests for trait implementation compliance
+- Tests for feature flag compilation
+- Integration tests with both backends
+
+**Files to Create/Modify**:
+- `src/index_trait.rs` (new)
+- `src/api.rs` (use trait)
+- `src/fdb_index.rs` (implement trait)
+- `src/mdbx_index.rs` (implement trait)
+- `Cargo.toml` (feature flags)
+
+---
+
+## Task 1.6: Update API Server for MDBX
+**Description**: Update the API server to use MDBX reads with the database abstraction.
+
+**Requirements**:
+- Switch `ApiState.index` to use `Arc<dyn IndexDatabase>`
+- Update all endpoint handlers to use trait methods
+- Add CLI flag `--mdbx-path` for MDBX database path
+- Maintain full backward compatibility with FDB
+
+**TDD Requirements**:
+- Integration tests for all API endpoints with MDBX backend
+- Tests for graceful degradation if database unavailable
+- Tests for concurrent API requests
+- API response format validation tests
+
+**Files to Modify**:
+- `src/api.rs`
+- `src/bin/api.rs`
+
+---
+
+## Task 1.7: Create MDBX ExEx Writer
+**Description**: Update the ExEx (Execution Extension) to write directly to MDBX.
+
+**Requirements**:
+- Add MDBX writer to main ExEx loop
+- Index committed blocks in real-time
+- Handle chain reorganizations (rollback)
+- Maintain block checkpoint for crash recovery
+
+**Technical Details**:
+- Hook into Reth's ExEx notification system
+- Process `ExExNotification::ChainCommitted` events
+- Use `ChainReverted` events for reorg handling
+- Atomic checkpoint updates
+
+**TDD Requirements**:
+- Unit tests for block processing logic
+- Integration tests for ExEx notifications
+- Tests for reorg handling scenarios
+- Tests for crash recovery
+
+**Files to Modify**:
+- `src/main.rs`
+
+---
+
+## Task 1.8: Update Backfill Tool for MDBX
+**Description**: Update backfill tool to write to MDBX instead of FDB.
+
+**Requirements**:
+- Add `--mdbx-path` argument
+- Support direct MDBX writes
+- Maintain progress checkpoint
+- Support resume from last checkpoint
+- Parallel block fetching with sequential writes
+
+**TDD Requirements**:
+- Tests for backfill progress tracking
+- Tests for resume functionality
+- Tests for data integrity after backfill
+- Performance benchmarks (target: 100 blocks/sec)
+
+**Files to Modify**:
+- `src/bin/backfill.rs`
+
+---
+
+# PHASE 2: Quick Wins (High Priority)
+
+## Task 2.1: Multi-Pool RPC Executor
+**Description**: Route RPC requests by computational cost across thread pools.
+
+**Requirements**:
+- Create three thread pools:
+  - `light_pool`: Balance queries, nonce checks (fast)
+  - `heavy_pool`: eth_call simulations (medium)
+  - `trace_pool`: Debug/trace operations (slow)
+- Automatic request classification by method name
+- Configurable pool sizes
+- Graceful overload handling with backpressure
+
+**Technical Details**:
+- Use `tokio::runtime::Builder` for dedicated runtimes
+- Request routing via middleware layer
+- Pool sizing: light=4, heavy=8, trace=2 (configurable)
+
+**TDD Requirements**:
+- Unit tests for request classification
+- Integration tests for pool routing
+- Load tests for backpressure behavior
+- Tests for graceful shutdown
+
+**Files to Create**:
+- `src/rpc_executor.rs` (new)
+
+---
+
+## Task 2.2: Memory-Bounded LRU Cache
+**Description**: Implement byte-tracked LRU cache using DashMap.
+
+**Requirements**:
+- Track memory usage in bytes, not entry count
+- Configurable max memory limit (default: 1GB)
+- Support for different value types with size estimation
+- Cache for: blocks, transactions, receipts, token metadata
+
+**Technical Details**:
+- Use `dashmap` for concurrent access
+- Implement `CacheEntry` trait with `size_bytes()` method
+- LRU eviction when memory threshold exceeded
+- Async-compatible cache interface
+
+**TDD Requirements**:
+- Unit tests for size tracking accuracy
+- Tests for eviction behavior at memory limit
+- Tests for concurrent access patterns
+- Memory usage validation tests
+
+**Files to Create**:
+- `src/cache.rs` (new)
+
+---
+
+## Task 2.3: Pre-allocated Buffer Pools
+**Description**: Zero-allocation I/O using pre-reserved buffer pools.
+
+**Requirements**:
+- Buffer pool for 4KB blocks
+- Configurable pool size
+- Thread-local buffer access for minimal contention
+- Integration with MDBX read operations
+
+**Technical Details**:
+- Use `parking_lot` for efficient locking
+- Implement `BufferGuard` RAII pattern
+- Pool sizing: 1024 buffers default
+
+**TDD Requirements**:
+- Unit tests for buffer allocation/deallocation
+- Tests for pool exhaustion behavior
+- Tests for thread-local access patterns
+- Performance benchmarks vs direct allocation
+
+**Files to Create**:
+- `src/buffer_pool.rs` (new)
+
+---
+
+# PHASE 3: Advanced Optimizations (Medium Priority)
+
+## Task 3.1: io_uring Integration
+**Description**: Async MDBX operations using io_uring for Linux systems.
+
+**Requirements**:
+- Separate read and write io_uring instances
+- Batch submission for multiple operations
+- Fallback to blocking I/O on non-Linux systems
+- Integration with buffer pool for zero-copy
+
+**Technical Details**:
+- Use `tokio-uring` crate
+- Ring sizes: read=256, write=64
+- SQE batching for bulk operations
+- Feature flag: `io-uring`
+
+**TDD Requirements**:
+- Unit tests for ring operations
+- Tests for fallback behavior
+- Performance benchmarks vs blocking I/O
+- Tests for buffer pool integration
+
+**Files to Create**:
+- `src/io_uring.rs` (new)
+
+---
+
+## Task 3.2: VersionStack for O(1) Reorgs
+**Description**: Implement persistent data structure for efficient chain reorganizations.
+
+**Requirements**:
+- O(1) version switching for reorgs
+- Structural sharing to minimize memory
+- Support rollback up to N blocks (configurable)
+- Integration with MDBX for persistence
+
+**Technical Details**:
+- Implement copy-on-write tree structure
+- Version tagging for each write batch
+- Garbage collection of old versions
+- Configurable reorg depth: 64 blocks
+
+**TDD Requirements**:
+- Unit tests for version creation/switching
+- Tests for structural sharing efficiency
+- Tests for deep reorg scenarios
+- Memory usage tests
+
+**Files to Create**:
+- `src/version_stack.rs` (new)
+
+---
+
+## Task 3.3: Parallel Processing Pipeline
+**Description**: Concurrent processing for log decoding, address lookups, and token metadata.
+
+**Requirements**:
+- Parallel log decoding across CPU cores
+- Concurrent address classification (EOA vs contract)
+- Parallel token metadata fetching
+- Work-stealing queue for load balancing
+
+**Technical Details**:
+- Use `rayon` for data parallelism
+- Async/sync boundary management
+- Configurable parallelism level
+
+**TDD Requirements**:
+- Unit tests for parallel decode correctness
+- Tests for work distribution
+- Tests for error handling in parallel context
+- Performance benchmarks
+
+**Files to Modify**:
+- `src/transform.rs`
+- `src/bin/backfill.rs`
+
+---
+
+# PHASE 4: Hardware Optimizations (Low Priority)
+
+## Task 4.1: Zone-Aware NVMe Support
+**Description**: Optimize writes for ZNS (Zoned Namespace) SSDs.
+
+**Requirements**:
+- Detect ZNS SSD capability
+- Sequential write patterns for zones
+- Fallback to zonefs for non-native support
+- Integration with MDBX write path
+
+**Technical Details**:
+- Use `libnvme` for device detection
+- Zone-aligned write batching
+- Feature flag: `zns`
+
+**TDD Requirements**:
+- Unit tests for zone detection
+- Tests for fallback behavior
+- Performance benchmarks on ZNS vs conventional SSD
+
+**Files to Create**:
+- `src/zns.rs` (new)
+
+---
+
+# PHASE 5: Integration & Deployment
+
+## Task 5.1: Migration Tool
+**Description**: Tool to migrate existing FDB data to MDBX.
+
+**Requirements**:
+- Stream data from FDB to MDBX
+- Progress reporting
+- Resume capability
+- Data validation after migration
+
+**TDD Requirements**:
+- Integration tests for full migration
+- Tests for resume functionality
+- Data integrity validation tests
+
+**Files to Create**:
+- `src/bin/migrate.rs` (new)
+
+---
+
+## Task 5.2: Benchmarking Suite
+**Description**: Comprehensive benchmarks comparing FDB vs MDBX performance.
+
+**Requirements**:
+- Backfill speed benchmarks
+- API latency benchmarks
+- Memory usage comparison
+- Reorg handling benchmarks
+
+**TDD Requirements**:
+- Automated benchmark CI
+- Regression detection
+
+**Files to Create**:
+- `benches/fdb_vs_mdbx.rs` (new)
+
+---
+
+## Task 5.3: Production Deployment
+**Description**: Deploy MDBX version to production server (root@aya).
+
+**Requirements**:
+- Build and deploy to remote server
+- Configuration for production workload
+- Monitoring and metrics setup
+- Rollback procedure
+
+**TDD Requirements**:
+- Smoke tests on production
+- Load testing
+- Monitoring validation
+
+**Remote Server**: root@aya (SSH access available)
+
+---
+
+# Dependencies and Prerequisites
+
+## External Dependencies (Cargo.toml additions)
+```toml
+# MDBX (already available via reth-db)
+reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3" }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3" }
+
+# Caching
+dashmap = "5.5"
+
+# Buffer pools
+parking_lot = "0.12"
+
+# io_uring (optional)
+tokio-uring = { version = "0.4", optional = true }
+
+# Parallel processing
+rayon = "1.8"
+```
+
+## Feature Flags
+```toml
+[features]
+default = ["fdb"]
+fdb = ["foundationdb"]
+mdbx = ["reth-db", "reth-db-api"]
+io-uring = ["tokio-uring"]
+zns = ["libnvme"]
+```
+
+---
+
+# Risk Assessment
+
+## High Risk Items
+- MDBX transaction semantics differ from FDB (no distributed transactions)
+- Performance regression during migration
+- Data integrity during live migration
+
+## Mitigation Strategies
+- Comprehensive TDD coverage
+- Dual-write mode during transition
+- Automated rollback procedures
+- Incremental feature flag rollout

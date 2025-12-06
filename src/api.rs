@@ -2845,8 +2845,8 @@ async fn indexing_status(State(state): State<Arc<ApiState>>) -> impl IntoRespons
         match get_chain_head(rpc_url).await {
             Ok(head) => {
                 let behind = if head > last_indexed { head - last_indexed } else { 0 };
-                // Allow up to 10 blocks lag since we do periodic backfill (not live indexing)
-                let finished = behind <= 10;
+                // Allow up to 20 blocks lag since we do periodic backfill (not live indexing)
+                let finished = behind <= 20;
                 (Some(head), behind, finished)
             }
             Err(_) => (None, 0, true)
