@@ -85,14 +85,15 @@ async fn main() -> Result<()> {
 
         drop(txn);
 
-        // Now write counters
-        info!("Writing counters...");
+        // Now write counters to Counters table (i64 little-endian, matching get_counter())
+        info!("Writing counters to Counters table...");
         let txn = env.begin_rw_txn()?;
-        let meta_db = txn.create_db(Some("Metadata"), DatabaseFlags::default())?;
+        let counters_db = txn.create_db(Some("Counters"), DatabaseFlags::default())?;
 
-        txn.put(meta_db.dbi(), b"total_txs", &tx_count.to_be_bytes(), WriteFlags::UPSERT)?;
-        txn.put(meta_db.dbi(), b"total_addresses", &addr_count.to_be_bytes(), WriteFlags::UPSERT)?;
-        txn.put(meta_db.dbi(), b"total_transfers", &transfer_count.to_be_bytes(), WriteFlags::UPSERT)?;
+        // Write as i64 little-endian to match get_counter() expectations
+        txn.put(counters_db.dbi(), b"total_txs", &(tx_count as i64).to_le_bytes(), WriteFlags::UPSERT)?;
+        txn.put(counters_db.dbi(), b"total_addresses", &(addr_count as i64).to_le_bytes(), WriteFlags::UPSERT)?;
+        txn.put(counters_db.dbi(), b"total_transfers", &(transfer_count as i64).to_le_bytes(), WriteFlags::UPSERT)?;
 
         txn.commit()?;
 
