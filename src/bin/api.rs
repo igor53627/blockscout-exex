@@ -9,8 +9,6 @@ use serde_json::json;
 
 use blockscout_exex::api::{create_router, ApiState};
 use blockscout_exex::cache::new_json_cache;
-#[cfg(feature = "fdb")]
-use blockscout_exex::fdb_index::FdbIndex;
 use blockscout_exex::IndexDatabase;
 #[cfg(feature = "mdbx")]
 use blockscout_exex::mdbx_index::MdbxIndex;
@@ -20,16 +18,11 @@ use blockscout_exex::websocket::{create_broadcaster, BroadcastMessage, Broadcast
 
 #[derive(Parser)]
 #[command(name = "blockscout-api")]
-#[command(about = "Blockscout-compatible API server backed by FoundationDB or MDBX")]
+#[command(about = "Blockscout-compatible API server backed by MDBX")]
 struct Args {
-    /// FoundationDB cluster file path (uses default if not specified)
+    /// MDBX database path (required)
     #[arg(long)]
-    cluster_file: Option<PathBuf>,
-
-    /// MDBX database path (mutually exclusive with --cluster-file)
-    #[cfg(feature = "mdbx")]
-    #[arg(long, conflicts_with = "cluster_file")]
-    mdbx_path: Option<PathBuf>,
+    mdbx_path: PathBuf,
 
     /// API server port (ignored if --socket is set)
     #[arg(long, default_value = "3000")]
@@ -66,68 +59,20 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Backend selection: MDBX or FDB
+    // MDBX backend only
+    #[cfg(feature = "mdbx")]
     let index: Arc<dyn IndexDatabase> = {
-        #[cfg(feature = "mdbx")]
-        if let Some(mdbx_path) = &args.mdbx_path {
-            tracing::info!("Using MDBX backend (read-only) at: {:?}", mdbx_path);
-            Arc::new(MdbxIndex::open_readonly(mdbx_path)?)
-        } else {
-            #[cfg(feature = "fdb")]
-            {
-                // Initialize FDB network - must be done once before any FDB operations
-                // Safety: We ensure the network guard is held until program exit
-                let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
-
-                tracing::info!("Using FoundationDB backend");
-                match &args.cluster_file {
-                    Some(path) => {
-                        tracing::info!("Using cluster file: {:?}", path);
-                        Arc::new(FdbIndex::open(path)?)
-                    }
-                    None => {
-                        tracing::info!("Using default cluster file");
-                        Arc::new(FdbIndex::open_default()?)
-                    }
-                }
-            }
-            #[cfg(not(feature = "fdb"))]
-            {
-                eyre::bail!("No backend configured. Build with --features fdb or --features mdbx")
-            }
-        }
-
-        #[cfg(not(feature = "mdbx"))]
-        {
-            #[cfg(feature = "fdb")]
-            {
-                // Initialize FDB network - must be done once before any FDB operations
-                // Safety: We ensure the network guard is held until program exit
-                let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
-
-                tracing::info!("Using FoundationDB backend");
-                match &args.cluster_file {
-                    Some(path) => {
-                        tracing::info!("Using cluster file: {:?}", path);
-                        Arc::new(FdbIndex::open(path)?)
-                    }
-                    None => {
-                        tracing::info!("Using default cluster file");
-                        Arc::new(FdbIndex::open_default()?)
-                    }
-                }
-            }
-            #[cfg(not(feature = "fdb"))]
-            {
-                eyre::bail!("No backend configured. Build with --features fdb or --features mdbx")
-            }
-        }
+        tracing::info!("Using MDBX backend (read-only) at: {:?}", args.mdbx_path);
+        Arc::new(MdbxIndex::open_readonly(&args.mdbx_path)?)
     };
+
+    #[cfg(not(feature = "mdbx"))]
+    {
+        eyre::bail!("MDBX feature not enabled. Build with --features mdbx")
+    }
 
     let last_block = index.last_indexed_block().await?;
     tracing::info!("Last indexed block: {:?}", last_block);
-
-    // Note: Address count refresh is backend-specific and handled internally by each backend
 
     let broadcaster = create_broadcaster();
 
@@ -157,14 +102,6 @@ async fn main() -> Result<()> {
     let rpc_executor: Option<Arc<RpcExecutor>> = None;
     if args.reth_rpc.is_some() {
         tracing::info!("RPC executor disabled (creates separate runtime, causes shutdown panic)");
-        // TODO: Refactor RpcExecutor to use tokio spawn_blocking or current runtime
-        // match RpcExecutor::new(4, 8, 2) {
-        //     Ok(executor) => Some(Arc::new(executor)),
-        //     Err(e) => {
-        //         tracing::warn!("Failed to create RPC executor: {}", e);
-        //         None
-        //     }
-        // }
     }
 
     // Initialize LRU caches for blocks and transactions (256MB each)
@@ -253,7 +190,7 @@ async fn block_watcher(reth_rpc: String, tx: Broadcaster) {
                             if let Ok(blk) = fetch_block_by_number(&client, &reth_rpc, block_height).await {
                                 let txs = blk["transactions"].as_array();
                                 let tx_count = txs.map(|t| t.len()).unwrap_or(0);
-                                
+
                                 tracing::info!("New block: {} ({} txs)", block_height, tx_count);
 
                                 // Broadcast block

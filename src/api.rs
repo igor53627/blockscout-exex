@@ -140,12 +140,21 @@ async fn backend_version() -> impl IntoResponse {
 }
 
 async fn stats(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    // Try reth reader first, fallback to index.last_indexed_block()
     #[cfg(feature = "reth")]
-    let last_block = state
-        .reth
-        .as_ref()
-        .and_then(|r| r.last_block_number().ok().flatten())
-        .unwrap_or(0);
+    let last_block = {
+        let from_reth = state
+            .reth
+            .as_ref()
+            .and_then(|r| r.last_block_number().ok().flatten());
+        match from_reth {
+            Some(b) => b,
+            None => tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.index.last_indexed_block()
+            ).await.unwrap_or(Ok(None)).unwrap_or(None).unwrap_or(0),
+        }
+    };
     #[cfg(not(feature = "reth"))]
     let last_block = tokio::time::timeout(
         std::time::Duration::from_secs(2),

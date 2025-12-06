@@ -6,11 +6,6 @@ license = "MIT"
 description = "Blockscout-compatible indexer as a Reth ExEx sidecar"
 
 [[bin]]
-name = "blockscout-exex"
-path = "src/main.rs"
-required-features = ["fdb"]
-
-[[bin]]
 name = "blockscout-backfill"
 path = "src/bin/backfill.rs"
 
@@ -21,11 +16,6 @@ path = "src/bin/api.rs"
 [[bin]]
 name = "blockscout-subscriber"
 path = "src/bin/subscriber.rs"
-
-[[bin]]
-name = "blockscout-migrate"
-path = "src/bin/migrate.rs"
-required-features = ["fdb"]
 
 [[bin]]
 name = "update-counters"
@@ -40,9 +30,6 @@ name = "compute-holder-counts"
 path = "src/bin/compute_holder_counts.rs"
 
 [dependencies]
-# Database - FoundationDB for distributed key-value storage
-foundationdb = { version = "0.9", features = ["embedded-fdb-include", "fdb-7_1"], optional = true }
-
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -108,8 +95,7 @@ reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth.git", tag 
 chrono = "0.4.42"
 
 [features]
-default = ["fdb"]
-fdb = ["foundationdb"]
+default = ["mdbx"]
 mdbx = ["reth"]
 reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-db-api", "reth-libmdbx", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
 exex = ["mdbx", "reth", "reth-exex", "reth-execution-types", "reth-node-api", "reth-tracing", "reth-primitives-traits"]
@@ -120,5 +106,5 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
-name = "fdb_vs_mdbx"
+name = "mdbx_bench"
 harness = false

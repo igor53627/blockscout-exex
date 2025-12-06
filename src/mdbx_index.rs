@@ -563,24 +563,36 @@ impl MdbxIndex {
         Err(eyre::eyre!("MDBX support requires 'reth' feature"))
     }
 
-    /// Get last indexed block from metadata
+    /// Get last indexed block from metadata, with fallback to Counters table
     #[cfg(feature = "reth")]
     pub fn get_last_indexed_block(&self) -> Result<Option<u64>> {
         let tx = self.env.tx()?;
 
-        // Try to open metadata table (may not exist yet)
-        let metadata_db = match tx.inner.open_db(Some(tables::METADATA)) {
-            Ok(db) => db,
-            Err(_) => return Ok(None), // Table doesn't exist yet
-        };
-
-        match tx.inner.get::<Vec<u8>>(metadata_db.dbi(), b"last_block") {
-            Ok(Some(bytes)) if bytes.len() >= 8 => {
-                let block = u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
-                Ok(Some(block))
+        // First try Metadata table (primary source, BE encoding)
+        if let Ok(metadata_db) = tx.inner.open_db(Some(tables::METADATA)) {
+            if let Ok(Some(bytes)) = tx.inner.get::<Vec<u8>>(metadata_db.dbi(), b"last_block") {
+                if bytes.len() >= 8 {
+                    let block = u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                    if block > 0 {
+                        return Ok(Some(block));
+                    }
+                }
             }
-            _ => Ok(None),
         }
+
+        // Fallback to Counters table (stored by update_counters, LE i64 encoding)
+        if let Ok(counters_db) = tx.inner.open_db(Some(tables::COUNTERS)) {
+            if let Ok(Some(bytes)) = tx.inner.get::<Vec<u8>>(counters_db.dbi(), b"last_block") {
+                if bytes.len() >= 8 {
+                    let block = i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                    if block > 0 {
+                        return Ok(Some(block as u64));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     #[cfg(not(feature = "reth"))]

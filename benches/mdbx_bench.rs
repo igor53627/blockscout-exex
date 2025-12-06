@@ -1,23 +1,20 @@
-//! Comprehensive benchmarks comparing FoundationDB vs MDBX performance
+//! MDBX performance benchmarks
 //!
-//! This benchmark suite validates the performance improvements of MDBX over FDB:
-//! - Backfill speed: Target 100+ blocks/sec vs 11 blocks/sec baseline
+//! This benchmark suite validates MDBX performance:
+//! - Backfill speed: Target 100+ blocks/sec
 //! - API latency: Target p99 < 50ms
 //! - Concurrent reads: Test parallel query performance
 //! - Memory usage: Track RSS during operations
 //!
-//! Run with: cargo bench --bench fdb_vs_mdbx
+//! Run with: cargo bench --bench mdbx_bench
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, black_box};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
-use alloy_primitives::{Address, TxHash, U256};
+use alloy_primitives::{Address, TxHash};
 use blockscout_exex::index_trait::{IndexDatabase, TokenTransfer};
-
-#[cfg(feature = "fdb")]
-use blockscout_exex::fdb_index::FdbIndex;
 
 #[cfg(feature = "reth")]
 use blockscout_exex::mdbx_index::MdbxIndex;
@@ -97,144 +94,7 @@ fn generate_transfer_data(
 }
 
 // ============================================================================
-// FDB Benchmarks (Baseline)
-// ============================================================================
-
-#[cfg(feature = "fdb")]
-async fn setup_fdb() -> Arc<FdbIndex> {
-    let cluster_file = std::env::var("FDB_CLUSTER_FILE")
-        .unwrap_or_else(|_| "/etc/foundationdb/fdb.cluster".to_string());
-
-    Arc::new(FdbIndex::new(&cluster_file).await.expect("Failed to create FDB index"))
-}
-
-#[cfg(feature = "fdb")]
-fn bench_fdb_backfill_speed(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let index = rt.block_on(setup_fdb());
-
-    let mut group = c.benchmark_group("backfill_speed");
-    group.measurement_time(Duration::from_secs(30));
-
-    // Benchmark: Index 100 blocks with varying transaction counts
-    for txs_per_block in [10, 50, 100] {
-        group.bench_with_input(
-            BenchmarkId::new("fdb", txs_per_block),
-            &txs_per_block,
-            |b, &txs| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let start_block = 1_000_000u64;
-                        for block_num in start_block..start_block + 100 {
-                            let txs_data = generate_block_data(block_num, txs);
-                            for (tx_hash, address, tx_idx) in txs_data {
-                                index.index_address_tx(
-                                    black_box(address),
-                                    black_box(block_num),
-                                    black_box(tx_idx),
-                                    black_box(tx_hash),
-                                ).await.expect("Failed to index tx");
-                            }
-                        }
-                    });
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
-#[cfg(feature = "fdb")]
-fn bench_fdb_api_latency(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let index = rt.block_on(setup_fdb());
-
-    // Pre-populate with test data
-    rt.block_on(async {
-        let test_addr = Address::from([1u8; 20]);
-        for block in 0..1000 {
-            for tx_idx in 0..10 {
-                let tx_hash = TxHash::from([block as u8; 32]);
-                index.index_address_tx(test_addr, block, tx_idx, tx_hash)
-                    .await
-                    .expect("Failed to index");
-            }
-        }
-    });
-
-    let mut group = c.benchmark_group("api_latency");
-    group.measurement_time(Duration::from_secs(20));
-
-    let test_addr = Address::from([1u8; 20]);
-
-    group.bench_function("fdb_get_address_txs", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                index.get_address_txs(black_box(test_addr), black_box(50), black_box(0))
-                    .await
-                    .expect("Failed to get txs")
-            })
-        });
-    });
-
-    group.finish();
-}
-
-#[cfg(feature = "fdb")]
-fn bench_fdb_concurrent_reads(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let index = rt.block_on(setup_fdb());
-
-    // Pre-populate with test data for 100 addresses
-    rt.block_on(async {
-        for addr_id in 0..100 {
-            let mut addr_bytes = [0u8; 20];
-            addr_bytes[0] = addr_id;
-            let test_addr = Address::from(addr_bytes);
-
-            for block in 0..100 {
-                let tx_hash = TxHash::from([addr_id; 32]);
-                index.index_address_tx(test_addr, block, 0, tx_hash)
-                    .await
-                    .expect("Failed to index");
-            }
-        }
-    });
-
-    let mut group = c.benchmark_group("concurrent_reads");
-    group.measurement_time(Duration::from_secs(20));
-
-    group.bench_function("fdb_100_parallel_queries", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let mut handles = Vec::new();
-
-                for addr_id in 0..100 {
-                    let index = Arc::clone(&index);
-                    let handle = tokio::spawn(async move {
-                        let mut addr_bytes = [0u8; 20];
-                        addr_bytes[0] = addr_id;
-                        let addr = Address::from(addr_bytes);
-
-                        index.get_address_txs(addr, 10, 0)
-                            .await
-                            .expect("Failed to get txs")
-                    });
-                    handles.push(handle);
-                }
-
-                for handle in handles {
-                    handle.await.expect("Task failed");
-                }
-            })
-        });
-    });
-
-    group.finish();
-}
-
-// ============================================================================
-// MDBX Benchmarks (Target)
+// MDBX Benchmarks
 // ============================================================================
 
 #[cfg(feature = "reth")]
@@ -455,14 +315,6 @@ fn bench_memory_usage(c: &mut Criterion) {
 // Benchmark Groups
 // ============================================================================
 
-#[cfg(feature = "fdb")]
-criterion_group!(
-    fdb_benches,
-    bench_fdb_backfill_speed,
-    bench_fdb_api_latency,
-    bench_fdb_concurrent_reads
-);
-
 #[cfg(feature = "reth")]
 criterion_group!(
     mdbx_benches,
@@ -479,19 +331,13 @@ criterion_group!(memory_benches, bench_memory_usage);
 // Main Entry Point
 // ============================================================================
 
-#[cfg(all(feature = "fdb", feature = "reth"))]
-criterion_main!(fdb_benches, mdbx_benches);
-
-#[cfg(all(feature = "fdb", not(feature = "reth")))]
-criterion_main!(fdb_benches);
-
-#[cfg(all(not(feature = "fdb"), feature = "reth", not(target_os = "linux")))]
+#[cfg(all(feature = "reth", not(target_os = "linux")))]
 criterion_main!(mdbx_benches);
 
-#[cfg(all(not(feature = "fdb"), feature = "reth", target_os = "linux"))]
+#[cfg(all(feature = "reth", target_os = "linux"))]
 criterion_main!(mdbx_benches, memory_benches);
 
-#[cfg(not(any(feature = "fdb", feature = "reth")))]
+#[cfg(not(feature = "reth"))]
 fn main() {
-    println!("No database backend enabled. Enable 'fdb' or 'reth' feature to run benchmarks.");
+    println!("MDBX feature not enabled. Enable 'mdbx' or 'reth' feature to run benchmarks.");
 }
