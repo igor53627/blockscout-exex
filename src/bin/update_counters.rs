@@ -61,39 +61,79 @@ async fn main() -> Result<()> {
         let tx_count = tx_stat.entries() as u64;
         info!("Total transactions (TxBlocks entries): {}", tx_count);
 
-        // Count unique addresses from AddressTxs (keys are: address[20] + block[8] + tx_idx[4])
-        // We iterate and count distinct address prefixes
+        // Count unique addresses from AddressTxs in batches to avoid transaction timeout
+        // Keys are: address[20] + block[8] + tx_idx[4], sorted by address
         let addr_txs_db = txn.open_db(Some("AddressTxs"))?;
         let addr_txs_stat = txn.db_stat(&addr_txs_db)?;
-        info!("AddressTxs has {} entries, counting unique addresses...", addr_txs_stat.entries());
+        info!("AddressTxs has {} entries, counting unique addresses in batches...", addr_txs_stat.entries());
+        drop(txn); // Release transaction before batch counting
 
-        let addr_count: u64 = {
+        let mut addr_count = 0u64;
+        let mut last_addr: Option<[u8; 20]> = None;
+        let mut start_key: Option<Vec<u8>> = None;
+        let batch_size = 10_000_000u64; // 10M entries per batch
+
+        loop {
+            let txn = env.begin_ro_txn()?;
+            let addr_txs_db = txn.open_db(Some("AddressTxs"))?;
             let mut cursor = txn.cursor(&addr_txs_db)?;
-            let mut count = 0u64;
-            let mut last_addr: Option<[u8; 20]> = None;
+            let mut batch_count = 0u64;
 
-            if cursor.first::<(), ()>()?.is_some() {
-                loop {
-                    if let Some((key, _)) = cursor.get_current::<Vec<u8>, Vec<u8>>()? {
-                        if key.len() >= 20 {
-                            let addr: [u8; 20] = key[0..20].try_into().unwrap_or([0u8; 20]);
-                            if last_addr.as_ref() != Some(&addr) {
-                                count += 1;
-                                last_addr = Some(addr);
-                                if count % 500_000 == 0 {
-                                    info!("  Counted {} unique addresses...", count);
-                                }
+            // Position cursor
+            let started = if let Some(ref key) = start_key {
+                cursor.set_range::<(), ()>(key)?.is_some()
+            } else {
+                cursor.first::<(), ()>()?.is_some()
+            };
+
+            if !started {
+                break;
+            }
+
+            loop {
+                if let Some((key, _)) = cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                    if key.len() >= 20 {
+                        let addr: [u8; 20] = key[0..20].try_into().unwrap_or([0u8; 20]);
+                        if last_addr.as_ref() != Some(&addr) {
+                            addr_count += 1;
+                            last_addr = Some(addr);
+                            if addr_count % 500_000 == 0 {
+                                info!("  Counted {} unique addresses...", addr_count);
                             }
                         }
                     }
+                    start_key = Some(key.clone());
+                }
+
+                batch_count += 1;
+                if batch_count >= batch_size {
+                    // Move to next key before ending batch
                     if cursor.next::<(), ()>()?.is_none() {
-                        break;
+                        start_key = None;
+                    } else if let Some((key, _)) = cursor.get_current::<Vec<u8>, Vec<u8>>()? {
+                        start_key = Some(key);
                     }
+                    break;
+                }
+
+                if cursor.next::<(), ()>()?.is_none() {
+                    start_key = None;
+                    break;
                 }
             }
-            count
-        };
+
+            drop(cursor);
+            drop(txn);
+
+            if start_key.is_none() {
+                break;
+            }
+            info!("  Batch complete, continuing from next position...");
+        }
         info!("Total unique addresses: {}", addr_count);
+
+        // Reopen transaction for remaining operations
+        let txn = env.begin_ro_txn()?;
 
         // TokenTransfers count
         let transfers_db = txn.open_db(Some("TokenTransfers"))?;
