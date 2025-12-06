@@ -10,7 +10,7 @@ pub mod cache;
 pub mod exex;
 pub mod index_trait;
 pub mod meili;
-#[cfg(feature = "mdbx")]
+#[cfg(feature = "reth")]
 pub mod mdbx_index;
 #[cfg(feature = "reth")]
 pub mod reth_reader;
@@ -21,7 +21,7 @@ pub mod websocket;
 // Re-export commonly used types
 pub use cache::{CacheEntry, CacheStats, LruCache, new_json_cache, new_bytes_cache, DEFAULT_MAX_SIZE};
 pub use index_trait::{IndexDatabase, TokenTransfer};
-#[cfg(feature = "mdbx")]
+#[cfg(feature = "reth")]
 pub use mdbx_index::MdbxIndex;
 pub use rpc_executor::{RpcExecutor, RpcRequest, RpcResponse};
 pub use transform::{decode_token_transfer, DecodedTransfer, TokenType};

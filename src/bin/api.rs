@@ -10,7 +10,6 @@ use serde_json::json;
 use blockscout_exex::api::{create_router, ApiState};
 use blockscout_exex::cache::new_json_cache;
 use blockscout_exex::IndexDatabase;
-#[cfg(feature = "mdbx")]
 use blockscout_exex::mdbx_index::MdbxIndex;
 use blockscout_exex::meili::SearchClient;
 use blockscout_exex::rpc_executor::RpcExecutor;
@@ -59,17 +58,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // MDBX backend only
-    #[cfg(feature = "mdbx")]
-    let index: Arc<dyn IndexDatabase> = {
-        tracing::info!("Using MDBX backend (read-only) at: {:?}", args.mdbx_path);
-        Arc::new(MdbxIndex::open_readonly(&args.mdbx_path)?)
-    };
-
-    #[cfg(not(feature = "mdbx"))]
-    {
-        eyre::bail!("MDBX feature not enabled. Build with --features mdbx")
-    }
+    // MDBX backend (always enabled)
+    tracing::info!("Using MDBX backend (read-only) at: {:?}", args.mdbx_path);
+    let index: Arc<dyn IndexDatabase> = Arc::new(MdbxIndex::open_readonly(&args.mdbx_path)?);
 
     let last_block = index.last_indexed_block().await?;
     tracing::info!("Last indexed block: {:?}", last_block);

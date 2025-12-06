@@ -8,12 +8,11 @@ This guide covers the complete production deployment process for Blockscout with
 
 1. [Prerequisites](#prerequisites)
 2. [Initial Deployment](#initial-deployment)
-3. [Migration from FDB to MDBX](#migration-from-fdb-to-mdbx)
-4. [Monitoring and Metrics](#monitoring-and-metrics)
-5. [Rollback Procedures](#rollback-procedures)
-6. [Operational Procedures](#operational-procedures)
-7. [Troubleshooting](#troubleshooting)
-8. [Performance Benchmarks](#performance-benchmarks)
+3. [Monitoring and Metrics](#monitoring-and-metrics)
+4. [Rollback Procedures](#rollback-procedures)
+5. [Operational Procedures](#operational-procedures)
+6. [Troubleshooting](#troubleshooting)
+7. [Performance Benchmarks](#performance-benchmarks)
 
 ---
 
@@ -25,7 +24,7 @@ This guide covers the complete production deployment process for Blockscout with
 - **RAM**: 8GB minimum, 16GB recommended
 - **Disk**: 100GB+ SSD (NVMe preferred)
 - **CPU**: 4+ cores
-- **Network**: Stable connection to Ethereum RPC node
+- **Network**: Stable connection to Reth node
 
 ### Software Requirements
 
@@ -37,7 +36,7 @@ This guide covers the complete production deployment process for Blockscout with
 ### Access Requirements
 
 - SSH key configured for `root@aya`
-- Ethereum RPC endpoint URL
+- Running Reth node with accessible database
 - (Optional) Meilisearch instance for search functionality
 
 ---
@@ -91,7 +90,7 @@ ssh root@aya journalctl -u blockscout-api -f
 /usr/local/bin/
 ├── blockscout-api          # Main API server
 ├── blockscout-backfill     # Historical data backfill
-└── blockscout-migrate      # Database migration utility
+└── blockscout-subscriber   # Live block subscriber
 
 /etc/blockscout/
 └── config.toml             # Optional configuration file
@@ -107,23 +106,20 @@ ssh root@aya journalctl -u blockscout-api -f
 
 ---
 
-## Migration from FDB to MDBX
+## Initial Data Backfill
 
-### Migration Strategy
-
-**Recommended approach**: Run MDBX in parallel, then switch over.
-
-### Step 1: Run Backfill on New MDBX Database
+### Running the Backfill
 
 ```bash
 # SSH to server
 ssh root@aya
 
-# Run backfill (adjust block range as needed)
+# Run backfill (adjust paths and block range as needed)
 /usr/local/bin/blockscout-backfill \
     --mdbx-path /var/lib/blockscout/mdbx \
-    --rpc-url http://localhost:8545 \
-    --from-block 0 \
+    --reth-db /path/to/reth/db \
+    --reth-static-files /path/to/reth/static_files \
+    --chain sepolia \
     --batch-size 100
 ```
 
@@ -131,44 +127,14 @@ ssh root@aya
 - MDBX backfill: ~100 blocks/sec
 - Total time for 20M blocks: ~55 hours
 
-### Step 2: Verify Data Integrity
+### Verify Data Integrity
 
 ```bash
-# Compare block counts
+# Check indexing status
 curl http://localhost:4000/api/v2/main-page/indexing-status
 
-# Compare sample addresses
+# Test sample address
 curl http://localhost:4000/api/v2/addresses/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb/transactions
-```
-
-### Step 3: Switch to MDBX
-
-The deployment script automatically configures MDBX. If already running FDB:
-
-```bash
-# Stop FDB-based service
-ssh root@aya systemctl stop blockscout-api-fdb
-
-# Update and restart with MDBX
-./scripts/deploy.sh
-
-# Verify MDBX is being used
-ssh root@aya journalctl -u blockscout-api -n 20 | grep -i mdbx
-```
-
-### Step 4: Decommission FDB (Optional)
-
-Once MDBX is stable for 7+ days:
-
-```bash
-# Disable FDB service
-ssh root@aya systemctl disable blockscout-api-fdb
-
-# Archive FDB data
-ssh root@aya tar czf /var/backups/fdb-archive-$(date +%Y%m%d).tar.gz /var/lib/foundationdb/
-
-# Remove FDB cluster file (keep backup)
-ssh root@aya mv /etc/foundationdb/fdb.cluster /etc/foundationdb/fdb.cluster.bak
 ```
 
 ---
@@ -259,25 +225,6 @@ ssh root@aya systemctl start blockscout-api
 
 # 5. Verify
 ssh root@aya systemctl status blockscout-api
-```
-
-### Rollback from MDBX to FDB
-
-If critical issues with MDBX:
-
-```bash
-# 1. Stop MDBX service
-ssh root@aya systemctl stop blockscout-api
-
-# 2. Switch service to use FDB cluster file
-ssh root@aya "sed -i 's/--mdbx-path.*/--cluster-file \/etc\/foundationdb\/fdb.cluster/' /etc/systemd/system/blockscout-api.service"
-
-# 3. Reload and restart
-ssh root@aya systemctl daemon-reload
-ssh root@aya systemctl start blockscout-api
-
-# 4. Verify FDB connection
-ssh root@aya journalctl -u blockscout-api -n 50 | grep -i fdb
 ```
 
 ---
@@ -468,8 +415,9 @@ ssh root@aya mv /var/lib/blockscout/mdbx /var/lib/blockscout/mdbx.corrupted
 # 3. Restore from backup or re-run backfill
 ssh root@aya /usr/local/bin/blockscout-backfill \
     --mdbx-path /var/lib/blockscout/mdbx \
-    --rpc-url http://localhost:8545 \
-    --from-block 0
+    --reth-db /path/to/reth/db \
+    --reth-static-files /path/to/reth/static_files \
+    --chain sepolia
 
 # 4. Restart service
 ssh root@aya systemctl start blockscout-api
@@ -481,15 +429,14 @@ ssh root@aya systemctl start blockscout-api
 
 ### Expected Performance Metrics
 
-Based on benchmarking suite (`cargo bench --bench fdb_vs_mdbx`):
+Based on benchmarking suite (`cargo bench --bench mdbx_bench`):
 
-| Metric | FDB (Baseline) | MDBX (Target) | Improvement |
-|--------|----------------|---------------|-------------|
-| **Backfill Speed** | ~11 blocks/sec | ~100 blocks/sec | **9.1x** |
-| **API Latency (P99)** | TBD | < 50ms | N/A |
-| **Recovery Time** | 2+ hours | < 1 minute | **120x** |
-| **Concurrent Reads** | TBD | TBD | N/A |
-| **Memory Usage** | TBD | TBD | N/A |
+| Metric | Target |
+|--------|--------|
+| **Backfill Speed** | ~100 blocks/sec |
+| **API Latency (P99)** | < 50ms |
+| **Recovery Time** | < 1 minute |
+| **Concurrent Reads** | > 200 QPS |
 
 ### Running Benchmarks
 
@@ -497,13 +444,10 @@ Based on benchmarking suite (`cargo bench --bench fdb_vs_mdbx`):
 
 ```bash
 # Run all benchmarks
-cargo bench --bench fdb_vs_mdbx
+cargo bench --bench mdbx_bench --no-default-features --features reth
 
 # Run specific benchmark
-cargo bench --bench fdb_vs_mdbx -- backfill_speed
-
-# Run with MDBX only
-cargo bench --bench fdb_vs_mdbx --features mdbx --no-default-features
+cargo bench --bench mdbx_bench -- backfill_speed
 ```
 
 #### Production Load Testing
@@ -515,7 +459,7 @@ go install github.com/rakyll/hey@latest
 # Test API endpoint
 hey -n 10000 -c 100 -m GET "http://aya:4000/api/v2/addresses/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb/transactions"
 
-# Expected results for MDBX:
+# Expected results:
 # - P99 latency < 50ms
 # - No errors
 # - Consistent throughput > 1000 RPS
@@ -604,11 +548,11 @@ curl http://localhost:9090/api/v1/query?query=up  # Prometheus status
 ### Related Documentation
 
 - [README.md](README.md) - Project overview
-- [AGENTS.md](AGENTS.md) - Development workflow
-- [Cargo.toml](Cargo.toml) - Dependencies and features
+- [BENCHMARKING.md](BENCHMARKING.md) - Benchmarking guide
+- [QUICKSTART.md](QUICKSTART.md) - Quick start guide
 
 ---
 
-**Last Updated**: 2024-12-05
-**Version**: 1.0
+**Last Updated**: 2024-12-06
+**Version**: 2.0
 **Maintained by**: Blockscout Development Team

@@ -162,6 +162,8 @@ async fn main() -> Result<()> {
         txn.put(counters_db.dbi(), b"total_txs", &(tx_count as i64).to_le_bytes(), WriteFlags::UPSERT)?;
         txn.put(counters_db.dbi(), b"total_addresses", &(addr_count as i64).to_le_bytes(), WriteFlags::UPSERT)?;
         txn.put(counters_db.dbi(), b"total_transfers", &(transfer_count as i64).to_le_bytes(), WriteFlags::UPSERT)?;
+        // Also store last_block in Counters as fallback (in case Metadata read fails)
+        txn.put(counters_db.dbi(), b"last_block", &(last_block as i64).to_le_bytes(), WriteFlags::UPSERT)?;
 
         txn.commit()?;
 

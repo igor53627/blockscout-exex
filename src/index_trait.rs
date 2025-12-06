@@ -1,7 +1,7 @@
 //! Database abstraction trait for index storage
 //!
-//! This module provides a unified trait for both FoundationDB and MDBX backends,
-//! enabling runtime selection via feature flags and trait objects.
+//! This module provides a unified trait for the MDBX database backend,
+//! enabling consistent access via trait objects.
 
 use async_trait::async_trait;
 use alloy_primitives::{Address, TxHash, U256};
@@ -114,8 +114,8 @@ impl TokenTransfer {
 
 /// Unified database trait for index operations
 ///
-/// Both FdbIndex and MdbxIndex implement this trait, allowing the API
-/// to work with either backend via dynamic dispatch (Arc<dyn IndexDatabase>).
+/// MdbxIndex implements this trait, allowing the API to work with
+/// the database via dynamic dispatch (Arc<dyn IndexDatabase>).
 #[async_trait]
 pub trait IndexDatabase: Send + Sync {
     // ============================================================================
@@ -231,20 +231,6 @@ mod tests {
         assert!(true, "Trait defined and is object-safe");
     }
 
-    #[cfg(feature = "fdb")]
-    #[tokio::test]
-    async fn test_fdb_implements_trait() {
-        // Test that FdbIndex implements IndexDatabase
-        use crate::fdb_index::FdbIndex;
-
-        // This compilation test verifies FdbIndex implements the trait
-        fn _check_implementation<T: IndexDatabase>(_val: &T) {}
-
-        // Note: We can't actually instantiate FdbIndex in a test without a running FDB cluster
-        // But the compilation proves the trait is implemented correctly
-        assert!(true, "FdbIndex implements IndexDatabase trait");
-    }
-
     #[cfg(feature = "reth")]
     #[tokio::test]
     async fn test_mdbx_implements_trait() {
@@ -257,23 +243,6 @@ mod tests {
         // Note: We can't easily instantiate MdbxIndex in a test environment
         // But the compilation proves the trait is implemented correctly
         assert!(true, "MdbxIndex implements IndexDatabase trait");
-    }
-
-    #[cfg(feature = "fdb")]
-    #[tokio::test]
-    async fn test_trait_object_with_fdb() {
-        use crate::fdb_index::FdbIndex;
-
-        // Verify we can use FdbIndex through the trait object
-        fn _accepts_trait_object(db: Arc<dyn IndexDatabase>) -> Arc<dyn IndexDatabase> {
-            db
-        }
-
-        // This would work with a real FdbIndex instance:
-        // let index = FdbIndex::open_default().unwrap();
-        // let trait_obj: Arc<dyn IndexDatabase> = Arc::new(index);
-
-        assert!(true, "FdbIndex can be used as IndexDatabase trait object");
     }
 
     #[cfg(feature = "reth")]

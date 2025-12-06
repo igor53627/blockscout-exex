@@ -135,7 +135,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
 
 async fn backend_version() -> impl IntoResponse {
     Json(json!({
-        "backend_version": "6.10.0-exex-fdb"
+        "backend_version": "6.10.0-exex-mdbx"
     }))
 }
 
@@ -161,7 +161,7 @@ async fn stats(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         state.index.last_indexed_block()
     ).await.unwrap_or(Ok(None)).unwrap_or(None).unwrap_or(0);
 
-    // Use timeout to prevent blocking if FDB is slow
+    // Use timeout to prevent blocking if database is slow
     let total_txs = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         state.index.get_total_txs()
@@ -260,7 +260,7 @@ async fn blocks(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         }
     }
 
-    // Fallback to FDB index
+    // Fallback to index
     let last_block = state.index.last_indexed_block().await.unwrap_or(None).unwrap_or(0);
     let items: Vec<Value> = (0..10)
         .filter_map(|i| {
@@ -2801,13 +2801,7 @@ async fn health_check(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     match state.index.last_indexed_block().await {
         Ok(Some(block)) => {
             // Database is accessible and has data
-            let backend = if cfg!(feature = "mdbx") {
-                "mdbx"
-            } else if cfg!(feature = "fdb") {
-                "fdb"
-            } else {
-                "unknown"
-            };
+            let backend = "mdbx";
 
             (
                 StatusCode::OK,
@@ -2825,7 +2819,7 @@ async fn health_check(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
                 Json(json!({
                     "status": "initializing",
                     "last_block": null,
-                    "backend": if cfg!(feature = "mdbx") { "mdbx" } else { "fdb" }
+                    "backend": "mdbx"
                 }))
             )
         }

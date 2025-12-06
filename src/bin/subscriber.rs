@@ -1,4 +1,4 @@
-//! Live block subscription - keeps index updated with new blocks
+//! Live block subscription - keeps MDBX index updated with new blocks
 //!
 //! Subscribes to new blocks via WebSocket and indexes them in real-time.
 //! Also catches up on any missed blocks between last_indexed and chain head.
@@ -15,16 +15,15 @@ use serde::Deserialize;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-#[cfg(feature = "fdb")]
-use blockscout_exex::fdb_index::{FdbIndex, TokenTransfer as FdbTokenTransfer};
 use blockscout_exex::index_trait::TokenTransfer;
 #[cfg(feature = "mdbx")]
 use blockscout_exex::mdbx_index::MdbxIndex;
 use blockscout_exex::transform::{decode_token_transfer, TokenType};
+use blockscout_exex::IndexDatabase;
 
 #[derive(Parser)]
 #[command(name = "blockscout-subscriber")]
-#[command(about = "Subscribe to new blocks and index them (supports FDB and MDBX backends)")]
+#[command(about = "Subscribe to new blocks and index them into MDBX")]
 struct Args {
     /// WebSocket endpoint URL
     #[arg(long, default_value = "ws://localhost:8546")]
@@ -34,14 +33,10 @@ struct Args {
     #[arg(long, default_value = "http://localhost:8545")]
     rpc_url: String,
 
-    /// FoundationDB cluster file path (uses default if not specified)
-    #[arg(long)]
-    cluster_file: Option<PathBuf>,
-
-    /// MDBX database path (mutually exclusive with --cluster-file)
+    /// MDBX database path
     #[cfg(feature = "mdbx")]
-    #[arg(long, conflicts_with = "cluster_file")]
-    mdbx_path: Option<PathBuf>,
+    #[arg(long)]
+    mdbx_path: PathBuf,
 
     /// Reconnect delay on disconnect (seconds)
     #[arg(long, default_value = "5")]
@@ -188,9 +183,10 @@ fn parse_tx_index(tx: &RpcTransaction) -> u32 {
         .unwrap_or(0)
 }
 
-// Index a block using the appropriate backend
+// Index a block into MDBX
+#[cfg(feature = "mdbx")]
 async fn index_block(
-    index: &IndexBackend,
+    index: &MdbxIndex,
     rpc: &RpcClient,
     block_number: u64,
     block_hash: Option<&str>,
@@ -214,94 +210,6 @@ async fn index_block(
         .map(|r| (r.transaction_hash.clone(), r))
         .collect();
 
-    // Delegate to backend-specific implementation
-    index_block_impl(index, &block, &receipt_map, block_number, timestamp).await
-}
-
-// FDB-specific implementation
-#[cfg(feature = "fdb")]
-async fn index_block_fdb(
-    index: &FdbIndex,
-    block: &RpcBlock,
-    receipt_map: &std::collections::HashMap<String, RpcReceipt>,
-    block_number: u64,
-    timestamp: u64,
-) -> Result<()> {
-    let mut batch = index.write_batch();
-
-    for tx in &block.transactions {
-        let tx_hash: TxHash = tx.hash.parse()?;
-        let from: Address = tx.from.parse()?;
-        let tx_idx = parse_tx_index(tx);
-
-        batch.insert_address_tx(from, tx_hash, block_number, tx_idx);
-
-        if let Some(to_str) = &tx.to {
-            if let Ok(to) = to_str.parse::<Address>() {
-                batch.insert_address_tx(to, tx_hash, block_number, tx_idx);
-            }
-        }
-
-        batch.insert_tx_block(tx_hash, block_number);
-
-        if let Some(receipt) = receipt_map.get(&tx.hash) {
-            for (log_index, rpc_log) in receipt.logs.iter().enumerate() {
-                if let Some(log) = parse_log(rpc_log) {
-                    let decoded_transfers = decode_token_transfer(&log);
-                    for decoded in decoded_transfers {
-                        let transfer = match decoded.token_type {
-                            TokenType::Erc721 => FdbTokenTransfer::new_erc721(
-                                tx_hash,
-                                log_index as u64,
-                                decoded.token_address,
-                                decoded.from,
-                                decoded.to,
-                                decoded.token_id.unwrap(),
-                                block_number,
-                                timestamp,
-                            ),
-                            TokenType::Erc1155 => FdbTokenTransfer::new_erc1155(
-                                tx_hash,
-                                log_index as u64,
-                                decoded.token_address,
-                                decoded.from,
-                                decoded.to,
-                                decoded.token_id.unwrap(),
-                                decoded.value,
-                                block_number,
-                                timestamp,
-                            ),
-                            TokenType::Erc20 => FdbTokenTransfer::new(
-                                tx_hash,
-                                log_index as u64,
-                                decoded.token_address,
-                                decoded.from,
-                                decoded.to,
-                                decoded.value,
-                                block_number,
-                                timestamp,
-                            ),
-                        };
-                        batch.insert_transfer(transfer);
-                    }
-                }
-            }
-        }
-    }
-
-    batch.commit(block_number).await?;
-    Ok(())
-}
-
-// MDBX-specific implementation
-#[cfg(feature = "mdbx")]
-async fn index_block_mdbx(
-    index: &MdbxIndex,
-    block: &RpcBlock,
-    receipt_map: &std::collections::HashMap<String, RpcReceipt>,
-    block_number: u64,
-    timestamp: u64,
-) -> Result<()> {
     let mut batch = index.write_batch();
 
     for tx in &block.transactions {
@@ -368,54 +276,10 @@ async fn index_block_mdbx(
     Ok(())
 }
 
-// Enum to hold either FDB or MDBX index
-enum IndexBackend {
-    #[cfg(feature = "fdb")]
-    Fdb(Arc<FdbIndex>),
-    #[cfg(feature = "mdbx")]
-    Mdbx(Arc<MdbxIndex>),
-}
-
-impl IndexBackend {
-    async fn last_indexed_block(&self) -> Result<Option<u64>> {
-        match self {
-            #[cfg(feature = "fdb")]
-            IndexBackend::Fdb(index) => {
-                use blockscout_exex::IndexDatabase;
-                (**index).last_indexed_block().await
-            }
-            #[cfg(feature = "mdbx")]
-            IndexBackend::Mdbx(index) => {
-                use blockscout_exex::IndexDatabase;
-                (**index).last_indexed_block().await
-            }
-        }
-    }
-}
-
-// Dispatcher to backend-specific implementations
-async fn index_block_impl(
-    index: &IndexBackend,
-    block: &RpcBlock,
-    receipt_map: &std::collections::HashMap<String, RpcReceipt>,
-    block_number: u64,
-    timestamp: u64,
-) -> Result<()> {
-    match index {
-        #[cfg(feature = "fdb")]
-        IndexBackend::Fdb(fdb_index) => {
-            index_block_fdb(fdb_index, block, receipt_map, block_number, timestamp).await
-        }
-        #[cfg(feature = "mdbx")]
-        IndexBackend::Mdbx(mdbx_index) => {
-            index_block_mdbx(mdbx_index, block, receipt_map, block_number, timestamp).await
-        }
-    }
-}
-
 /// Catch up on any missed blocks between last_indexed and chain head
+#[cfg(feature = "mdbx")]
 async fn catchup_missed_blocks(
-    index: &IndexBackend,
+    index: &MdbxIndex,
     rpc: &RpcClient,
     batch_size: u64,
 ) -> Result<u64> {
@@ -446,7 +310,6 @@ async fn catchup_missed_blocks(
         for block_num in current..=batch_end {
             if let Err(e) = index_block(index, rpc, block_num, None).await {
                 error!("Failed to index block {}: {}", block_num, e);
-                // Continue with next block, don't fail the whole catchup
             }
         }
 
@@ -467,7 +330,8 @@ async fn catchup_missed_blocks(
     Ok(chain_head)
 }
 
-async fn subscribe_loop(args: &Args, index: &IndexBackend) -> Result<()> {
+#[cfg(feature = "mdbx")]
+async fn subscribe_loop(args: &Args, index: &MdbxIndex) -> Result<()> {
     let rpc = RpcClient::new(&args.rpc_url);
 
     // First, catch up on any missed blocks
@@ -570,79 +434,30 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Backend selection: MDBX or FDB
-    let index: IndexBackend = {
-        #[cfg(feature = "mdbx")]
-        if let Some(mdbx_path) = &args.mdbx_path {
-            info!("Using MDBX backend at: {:?}", mdbx_path);
-            IndexBackend::Mdbx(Arc::new(MdbxIndex::open(mdbx_path)?))
-        } else {
-            #[cfg(feature = "fdb")]
-            {
-                // Initialize FDB network - must be done once before any FDB operations
-                // Safety: We ensure the network guard is held until program exit
-                let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
+    #[cfg(feature = "mdbx")]
+    {
+        info!("Using MDBX backend at: {:?}", args.mdbx_path);
+        let index = MdbxIndex::open(&args.mdbx_path)?;
 
-                info!("Using FoundationDB backend");
-                let fdb_index = match &args.cluster_file {
-                    Some(path) => {
-                        info!("Using cluster file: {:?}", path);
-                        FdbIndex::open(path)?
-                    }
-                    None => {
-                        info!("Using default cluster file");
-                        FdbIndex::open_default()?
-                    }
-                };
-                IndexBackend::Fdb(Arc::new(fdb_index))
+        let last_block = index.last_indexed_block().await?;
+        info!("Last indexed block: {:?}", last_block);
+
+        loop {
+            match subscribe_loop(&args, &index).await {
+                Ok(_) => {
+                    info!("Subscription ended, reconnecting...");
+                }
+                Err(e) => {
+                    error!("Subscription error: {}, reconnecting...", e);
+                }
             }
-            #[cfg(not(feature = "fdb"))]
-            {
-                eyre::bail!("No backend configured. Build with --features fdb or --features mdbx")
-            }
+
+            tokio::time::sleep(Duration::from_secs(args.reconnect_delay)).await;
         }
+    }
 
-        #[cfg(not(feature = "mdbx"))]
-        {
-            #[cfg(feature = "fdb")]
-            {
-                // Initialize FDB network - must be done once before any FDB operations
-                // Safety: We ensure the network guard is held until program exit
-                let _network = unsafe { blockscout_exex::fdb_index::init_fdb_network() };
-
-                info!("Using FoundationDB backend");
-                let fdb_index = match &args.cluster_file {
-                    Some(path) => {
-                        info!("Using cluster file: {:?}", path);
-                        FdbIndex::open(path)?
-                    }
-                    None => {
-                        info!("Using default cluster file");
-                        FdbIndex::open_default()?
-                    }
-                };
-                IndexBackend::Fdb(Arc::new(fdb_index))
-            }
-            #[cfg(not(feature = "fdb"))]
-            {
-                eyre::bail!("No backend configured. Build with --features fdb or --features mdbx")
-            }
-        }
-    };
-
-    let last_block = index.last_indexed_block().await?;
-    info!("Last indexed block: {:?}", last_block);
-
-    loop {
-        match subscribe_loop(&args, &index).await {
-            Ok(_) => {
-                info!("Subscription ended, reconnecting...");
-            }
-            Err(e) => {
-                error!("Subscription error: {}, reconnecting...", e);
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(args.reconnect_delay)).await;
+    #[cfg(not(feature = "mdbx"))]
+    {
+        eyre::bail!("MDBX feature not enabled. Build with --features mdbx");
     }
 }

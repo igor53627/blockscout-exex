@@ -1,6 +1,6 @@
 # Blockscout MDBX Quick Start Guide
 
-## 🚀 Production Deployment (5 minutes)
+## Production Deployment (5 minutes)
 
 ### 1. Deploy to Server
 
@@ -45,16 +45,16 @@ ssh root@aya journalctl -u blockscout-api -f
 
 ---
 
-## 📊 Running Benchmarks
+## Running Benchmarks
 
 ### Quick Benchmark Run
 
 ```bash
-# MDBX benchmarks only
-cargo bench --bench fdb_vs_mdbx --no-default-features --features reth
+# MDBX benchmarks
+cargo bench --bench mdbx_bench --no-default-features --features reth
 
 # Specific benchmark
-cargo bench --bench fdb_vs_mdbx -- backfill_speed
+cargo bench --bench mdbx_bench -- backfill_speed
 ```
 
 ### Expected Results
@@ -69,7 +69,7 @@ See [BENCHMARKING.md](BENCHMARKING.md) for details.
 
 ---
 
-## 🔄 Rollback Procedure
+## Rollback Procedure
 
 ```bash
 # List available backups
@@ -81,7 +81,7 @@ ssh root@aya ls -lh /var/backups/blockscout/
 
 ---
 
-## 🔍 Monitoring & Health Checks
+## Monitoring & Health Checks
 
 ### Quick Health Check
 
@@ -111,7 +111,7 @@ ssh root@aya journalctl -u blockscout-api -p err --since "1 hour ago"
 
 ---
 
-## 📁 Important Paths
+## Important Paths
 
 ```
 Server: root@aya
@@ -125,7 +125,7 @@ Logs:       journalctl -u blockscout-api
 
 ---
 
-## 🆘 Emergency Procedures
+## Emergency Procedures
 
 ### Service Won't Start
 
@@ -140,21 +140,19 @@ ssh root@aya /usr/local/bin/blockscout-api --help
 ssh root@aya systemctl restart blockscout-api
 ```
 
-### Rollback Everything
+### Rollback to Previous Version
 
 ```bash
-# Emergency rollback
-./scripts/rollback.sh <last_good_backup_timestamp>
+# List available backups
+ssh root@aya ls -lh /var/backups/blockscout/
 
-# Or manually switch back to FDB
-ssh root@aya "systemctl stop blockscout-api"
-ssh root@aya "sed -i 's/--mdbx-path.*/--cluster-file \/etc\/foundationdb\/fdb.cluster/' /etc/systemd/system/blockscout-api.service"
-ssh root@aya "systemctl daemon-reload && systemctl start blockscout-api"
+# Rollback
+./scripts/rollback.sh <last_good_backup_timestamp>
 ```
 
 ---
 
-## 📚 Full Documentation
+## Full Documentation
 
 - [DEPLOYMENT.md](DEPLOYMENT.md) - Complete deployment guide
 - [BENCHMARKING.md](BENCHMARKING.md) - Benchmarking guide
@@ -162,16 +160,16 @@ ssh root@aya "systemctl daemon-reload && systemctl start blockscout-api"
 
 ---
 
-## 🎯 Performance Targets
+## Performance Targets
 
-| Metric | FDB (Current) | MDBX (Target) | Improvement |
-|--------|---------------|---------------|-------------|
-| **Backfill Speed** | 11 blocks/sec | 100+ blocks/sec | **9.1x** |
-| **Recovery Time** | 2+ hours | < 1 minute | **120x** |
-| **API Latency P99** | TBD | < 50ms | TBD |
+| Metric | Target |
+|--------|--------|
+| **Backfill Speed** | 100+ blocks/sec |
+| **Recovery Time** | < 1 minute |
+| **API Latency P99** | < 50ms |
 
 ---
 
-**Last Updated**: 2024-12-05
-**Version**: 1.0
-**Status**: Production Ready ✅
+**Last Updated**: 2024-12-06
+**Version**: 2.0
+**Status**: Production Ready

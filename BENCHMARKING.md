@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the comprehensive benchmarking suite for comparing FoundationDB (FDB) and MDBX performance in the Blockscout indexer.
+This document describes the benchmarking suite for MDBX performance in the Blockscout indexer.
 
 ## Running Benchmarks
 
@@ -13,26 +13,20 @@ This document describes the comprehensive benchmarking suite for comparing Found
 cargo install cargo-criterion
 
 # Ensure you have the required features enabled
-cargo build --release --features mdbx
+cargo build --release --features reth
 ```
 
 ### Quick Start
 
 ```bash
-# Run all benchmarks (FDB + MDBX)
-cargo bench --bench fdb_vs_mdbx
-
-# Run only MDBX benchmarks
-cargo bench --bench fdb_vs_mdbx --no-default-features --features reth
-
-# Run only FDB benchmarks
-cargo bench --bench fdb_vs_mdbx --features fdb --no-default-features
+# Run all MDBX benchmarks
+cargo bench --bench mdbx_bench --no-default-features --features reth
 
 # Run specific benchmark group
-cargo bench --bench fdb_vs_mdbx -- backfill_speed
-cargo bench --bench fdb_vs_mdbx -- api_latency
-cargo bench --bench fdb_vs_mdbx -- concurrent_reads
-cargo bench --bench fdb_vs_mdbx -- memory_usage
+cargo bench --bench mdbx_bench -- backfill_speed
+cargo bench --bench mdbx_bench -- api_latency
+cargo bench --bench mdbx_bench -- concurrent_reads
+cargo bench --bench mdbx_bench -- write_throughput
 ```
 
 ## Benchmark Categories
@@ -43,7 +37,7 @@ cargo bench --bench fdb_vs_mdbx -- memory_usage
 
 **Command**:
 ```bash
-cargo bench --bench fdb_vs_mdbx -- backfill_speed
+cargo bench --bench mdbx_bench -- backfill_speed
 ```
 
 **Metrics**:
@@ -52,14 +46,11 @@ cargo bench --bench fdb_vs_mdbx -- backfill_speed
 - Variation across different transaction densities (10, 50, 100 txs/block)
 
 **Expected Results**:
-| Database | Txs/Block | Speed | Improvement |
-|----------|-----------|-------|-------------|
-| FDB      | 10        | ~11 blocks/sec | Baseline |
-| MDBX     | 10        | ~100 blocks/sec | **9.1x** |
-| FDB      | 50        | ~8 blocks/sec  | Baseline |
-| MDBX     | 50        | ~85 blocks/sec | **10.6x** |
-| FDB      | 100       | ~5 blocks/sec  | Baseline |
-| MDBX     | 100       | ~70 blocks/sec | **14x** |
+| Txs/Block | Speed | Notes |
+|-----------|-------|-------|
+| 10        | ~100 blocks/sec | Light blocks |
+| 50        | ~85 blocks/sec | Medium blocks |
+| 100       | ~70 blocks/sec | Heavy blocks |
 
 ### 2. API Latency
 
@@ -67,7 +58,7 @@ cargo bench --bench fdb_vs_mdbx -- backfill_speed
 
 **Command**:
 ```bash
-cargo bench --bench fdb_vs_mdbx -- api_latency
+cargo bench --bench mdbx_bench -- api_latency
 ```
 
 **Metrics**:
@@ -76,10 +67,11 @@ cargo bench --bench fdb_vs_mdbx -- api_latency
 - Latency distribution
 
 **Expected Results**:
-| Database | P50 | P95 | P99 | Target |
-|----------|-----|-----|-----|--------|
-| FDB      | TBD | TBD | TBD | N/A    |
-| MDBX     | < 10ms | < 30ms | **< 50ms** | **✓** |
+| Metric | Target |
+|--------|--------|
+| P50 | < 10ms |
+| P95 | < 30ms |
+| P99 | **< 50ms** |
 
 ### 3. Concurrent Reads
 
@@ -87,7 +79,7 @@ cargo bench --bench fdb_vs_mdbx -- api_latency
 
 **Command**:
 ```bash
-cargo bench --bench fdb_vs_mdbx -- concurrent_reads
+cargo bench --bench mdbx_bench -- concurrent_reads
 ```
 
 **Metrics**:
@@ -96,10 +88,10 @@ cargo bench --bench fdb_vs_mdbx -- concurrent_reads
 - Throughput under load
 
 **Expected Results**:
-| Database | Total Time | QPS | Improvement |
-|----------|-----------|-----|-------------|
-| FDB      | TBD       | TBD | Baseline    |
-| MDBX     | < 500ms   | > 200 | TBD       |
+| Metric | Target |
+|--------|--------|
+| Total Time | < 500ms |
+| QPS | > 200 |
 
 ### 4. Write Throughput
 
@@ -107,7 +99,7 @@ cargo bench --bench fdb_vs_mdbx -- concurrent_reads
 
 **Command**:
 ```bash
-cargo bench --bench fdb_vs_mdbx -- write_throughput
+cargo bench --bench mdbx_bench -- write_throughput
 ```
 
 **Metrics**:
@@ -122,7 +114,7 @@ cargo bench --bench fdb_vs_mdbx -- write_throughput
 **Command**:
 ```bash
 # Only available on Linux
-cargo bench --bench fdb_vs_mdbx -- memory_usage
+cargo bench --bench mdbx_bench -- memory_usage
 ```
 
 **Metrics**:
@@ -151,7 +143,7 @@ backfill_speed/mdbx/50  time:   [1.1234 s 1.1567 s 1.1923 s]
 
 | Metric | Target | Rationale |
 |--------|--------|-----------|
-| Backfill Speed | 100+ blocks/sec | Full mainnet sync in ~55 hours (vs. 20+ days with FDB) |
+| Backfill Speed | 100+ blocks/sec | Full mainnet sync in ~55 hours |
 | API Latency P99 | < 50ms | Acceptable UX for block explorer |
 | Concurrent QPS | > 200 | Support moderate production traffic |
 | Memory Overhead | < 1GB | Efficient resource usage |
@@ -162,7 +154,7 @@ backfill_speed/mdbx/50  time:   [1.1234 s 1.1567 s 1.1923 s]
 
 #### Adjust Block Count
 
-Edit `benches/fdb_vs_mdbx.rs`:
+Edit `benches/mdbx_bench.rs`:
 
 ```rust
 // Change this:
@@ -183,10 +175,10 @@ for txs_per_block in [10, 50, 100, 200, 500] {
 
 ```bash
 # Baseline run
-cargo bench --bench fdb_vs_mdbx --features fdb --no-default-features -- --save-baseline fdb-baseline
+cargo bench --bench mdbx_bench -- --save-baseline baseline
 
-# MDBX comparison run
-cargo bench --bench fdb_vs_mdbx --features reth --no-default-features -- --baseline fdb-baseline
+# Comparison run after changes
+cargo bench --bench mdbx_bench -- --baseline baseline
 ```
 
 ### Profiling with Flamegraphs
@@ -198,7 +190,7 @@ cargo install flamegraph
 
 Profile specific benchmark:
 ```bash
-cargo flamegraph --bench fdb_vs_mdbx -- --bench backfill_speed
+cargo flamegraph --bench mdbx_bench -- --bench backfill_speed
 ```
 
 ### Export Results
@@ -223,15 +215,15 @@ cargo criterion --message-format=json > benchmark-results.json
 # Time a full backfill from block 0 to latest
 time ./target/release/blockscout-backfill \
     --mdbx-path /tmp/test-mdbx \
-    --rpc-url https://eth.llamarpc.com \
-    --from-block 0 \
-    --to-block 21000000 \
+    --reth-db /path/to/reth/db \
+    --reth-static-files /path/to/reth/static_files \
+    --chain mainnet \
     --batch-size 100
 ```
 
 **Expected Duration** (MDBX):
 - 21M blocks ÷ 100 blocks/sec = 58.3 hours
-- With network latency: ~72 hours
+- With I/O overhead: ~72 hours
 
 #### Scenario 2: API Load Test
 
@@ -245,7 +237,7 @@ go install github.com/rakyll/hey@latest
 hey -n 10000 -c 100 -m GET \
     "http://localhost:4000/api/v2/addresses/0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb/transactions"
 
-# Expected results (MDBX):
+# Expected results:
 # - Success rate: 100%
 # - P99 latency: < 50ms
 # - Throughput: > 1000 RPS
@@ -258,7 +250,7 @@ hey -n 10000 -c 100 -m GET \
 while true; do
     ./target/release/blockscout-backfill \
         --mdbx-path /var/lib/blockscout/mdbx \
-        --rpc-url http://localhost:8545 \
+        --reth-db /path/to/reth/db \
         --from-block $START_BLOCK \
         --batch-size 100
     START_BLOCK=$((START_BLOCK + 1000))
@@ -300,7 +292,7 @@ jobs:
           toolchain: stable
 
       - name: Run benchmarks
-        run: cargo bench --bench fdb_vs_mdbx --no-default-features --features reth
+        run: cargo bench --bench mdbx_bench --no-default-features --features reth
 
       - name: Store benchmark results
         uses: benchmark-action/github-action-benchmark@v1
@@ -312,18 +304,6 @@ jobs:
 ## Troubleshooting
 
 ### Benchmark Failures
-
-#### "Database connection failed"
-
-FDB benchmarks require FoundationDB to be running:
-
-```bash
-# Check FDB status
-fdbcli --exec status
-
-# If not running, skip FDB benchmarks
-cargo bench --bench fdb_vs_mdbx --no-default-features --features reth
-```
 
 #### "Temporary directory permission denied"
 
@@ -344,7 +324,7 @@ System load affects benchmarks:
 sudo cpupower frequency-set --governor performance
 
 # Run benchmarks with higher sample size
-cargo bench --bench fdb_vs_mdbx -- --sample-size 100
+cargo bench --bench mdbx_bench -- --sample-size 100
 ```
 
 ## Performance Regression Detection
@@ -371,10 +351,10 @@ api_latency = { max_regression = 0.05 }     # Fail if > 5% slower
 THRESHOLD=0.10  # 10% regression threshold
 
 # Run benchmarks and save baseline
-cargo bench --bench fdb_vs_mdbx -- --save-baseline current
+cargo bench --bench mdbx_bench -- --save-baseline current
 
 # Compare with previous baseline
-cargo bench --bench fdb_vs_mdbx -- --baseline previous
+cargo bench --bench mdbx_bench -- --baseline previous
 
 # Check for regressions
 if [ $? -ne 0 ]; then
@@ -387,7 +367,7 @@ fi
 
 ### Benchmark Configuration
 
-Criterion settings in `benches/fdb_vs_mdbx.rs`:
+Criterion settings in `benches/mdbx_bench.rs`:
 
 ```rust
 let mut group = c.benchmark_group("backfill_speed");
@@ -411,6 +391,6 @@ CRITERION_CSV=1 cargo bench
 
 ---
 
-**Last Updated**: 2024-12-05
-**Version**: 1.0
+**Last Updated**: 2024-12-06
+**Version**: 2.0
 **Related**: [DEPLOYMENT.md](DEPLOYMENT.md), [README.md](README.md)
