@@ -100,6 +100,11 @@ reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-exex = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.9.3", optional = true }
 chrono = "0.4.42"
 
 [features]
@@ -107,6 +112,7 @@ default = ["fdb"]
 fdb = ["foundationdb"]
 mdbx = ["reth"]
 reth = ["alloy-eips", "alloy-consensus", "reth-db", "reth-db-api", "reth-libmdbx", "reth-provider", "reth-primitives", "reth-chainspec", "reth-node-types", "reth-node-ethereum"]
+exex = ["mdbx", "reth", "reth-exex", "reth-execution-types", "reth-node-api", "reth-tracing", "reth-primitives-traits"]
 
 [dev-dependencies]
 tokio-test = "0.4"

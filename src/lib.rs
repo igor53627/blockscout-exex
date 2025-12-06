@@ -6,6 +6,8 @@
 pub mod api;
 pub mod buffer_pool;
 pub mod cache;
+#[cfg(feature = "exex")]
+pub mod exex;
 #[cfg(feature = "fdb")]
 pub mod fdb_index;
 pub mod index_trait;
