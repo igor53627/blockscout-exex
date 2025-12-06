@@ -2856,7 +2856,14 @@ async fn indexing_status(State(state): State<Arc<ApiState>>) -> impl IntoRespons
 
     let ratio = if let Some(head) = chain_head {
         if head > 0 {
-            format!("{:.4}", last_indexed as f64 / head as f64)
+            let raw_ratio = last_indexed as f64 / head as f64;
+            // Cap at 0.9999 if not finished to prevent UI showing 100% while still indexing
+            let capped = if !finished && raw_ratio >= 0.9999 {
+                0.9999
+            } else {
+                raw_ratio
+            };
+            format!("{:.4}", capped)
         } else {
             "1.00".to_string()
         }
