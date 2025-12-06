@@ -478,7 +478,7 @@ impl MdbxIndex {
         // Create database arguments with custom geometry
         let args = DatabaseArguments::new(ClientVersion::default())
             .with_max_readers(Some(256))
-            .with_geometry_max_size(Some(1024 * GIGABYTE))  // 1TB max
+            .with_geometry_max_size(Some(1536 * GIGABYTE))  // 1.5TB max
             .with_sync_mode(Some(SyncMode::SafeNoSync));
 
         let env = DatabaseEnv::open(path, DatabaseEnvKind::RW, args)?;

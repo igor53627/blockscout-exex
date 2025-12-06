@@ -152,18 +152,20 @@ async fn main() -> Result<()> {
     };
 
     // Initialize RPC executor with dedicated thread pools
-    let rpc_executor = if args.reth_rpc.is_some() {
-        tracing::info!("Initializing RPC executor with thread pools (light:4, heavy:8, trace:2)");
-        match RpcExecutor::new(4, 8, 2) {
-            Ok(executor) => Some(Arc::new(executor)),
-            Err(e) => {
-                tracing::warn!("Failed to create RPC executor: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // NOTE: RpcExecutor creates separate tokio runtimes which can't be dropped in async context
+    // For now, disable it to avoid runtime panic on shutdown. The API still works without it.
+    let rpc_executor: Option<Arc<RpcExecutor>> = None;
+    if args.reth_rpc.is_some() {
+        tracing::info!("RPC executor disabled (creates separate runtime, causes shutdown panic)");
+        // TODO: Refactor RpcExecutor to use tokio spawn_blocking or current runtime
+        // match RpcExecutor::new(4, 8, 2) {
+        //     Ok(executor) => Some(Arc::new(executor)),
+        //     Err(e) => {
+        //         tracing::warn!("Failed to create RPC executor: {}", e);
+        //         None
+        //     }
+        // }
+    }
 
     // Initialize LRU caches for blocks and transactions (256MB each)
     let block_cache = Arc::new(new_json_cache(256 * 1024 * 1024));
